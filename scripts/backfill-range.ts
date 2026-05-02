@@ -156,43 +156,74 @@ async function main() {
     }
   }
 
-  // 重建受影响时间范围的 buckets
+  // 重建受影响时间范围的 buckets（事务 + LOCK + ON CONFLICT 防 stream 竞争）
   if (ranges.length > 0) {
     const minFrom = ranges.reduce((m, r) => (r.from < m ? r.from : m), ranges[0].from);
-    const maxTo = ranges.reduce((m, r) => (r.to > m ? r.to : m), ranges[0].to);
     const blkMin = await httpClient.getBlock({ blockNumber: minFrom });
     const rangeStartMs = Number(blkMin.timestamp) * 1000 - 60_000;
     console.log(`[Retry] 重建 buckets from ${new Date(rangeStartMs).toISOString()}`);
-    await getPool().query(`DELETE FROM token_1min_stats WHERE bucket_start >= $1`, [rangeStartMs]);
-    await getPool().query(`DELETE FROM pool_1min_stats WHERE bucket_start >= $1`, [rangeStartMs]);
-    await getPool().query(
-      `INSERT INTO pool_1min_stats (pool_address, chain, bucket_start, total_fees_usd, total_volume_usd, swap_count)
-       SELECT pool_address, chain, (timestamp/60000)*60000, COALESCE(SUM(fee_usd),0), COALESCE(SUM(volume_usd),0), COUNT(*)::int
-       FROM swaps WHERE timestamp >= $1
-       GROUP BY pool_address, chain, (timestamp/60000)*60000`,
-      [rangeStartMs]
-    );
-    await getPool().query(
-      `WITH all_pools AS (
-         SELECT address AS pool_id, chain, LOWER(token0) AS t0, LOWER(token1) AS t1 FROM pools
-         UNION ALL
-         SELECT pool_id, chain, LOWER(currency0), LOWER(currency1) FROM v4_pools
-       ),
-       pool_target AS (
-         SELECT ap.pool_id, ap.chain, LOWER(bt.contract_address) AS target_token
-         FROM all_pools ap
-         JOIN binance_bsc_tokens bt
-           ON ap.t0 = LOWER(bt.contract_address) OR ap.t1 = LOWER(bt.contract_address)
-       )
-       INSERT INTO token_1min_stats (token_address, chain, bucket_start, total_volume_usd, total_fees_usd, swap_count)
-       SELECT pt.target_token, s.chain, (s.timestamp/60000)*60000,
-              COALESCE(SUM(s.volume_usd),0), COALESCE(SUM(s.fee_usd),0), COUNT(*)::int
-       FROM swaps s
-       JOIN pool_target pt ON pt.pool_id = s.pool_address AND pt.chain = s.chain
-       WHERE s.timestamp >= $1
-       GROUP BY pt.target_token, s.chain, (s.timestamp/60000)*60000`,
-      [rangeStartMs]
-    );
+
+    const c1 = await getPool().connect();
+    try {
+      await c1.query("BEGIN");
+      await c1.query("LOCK TABLE pool_1min_stats IN EXCLUSIVE MODE");
+      await c1.query(`DELETE FROM pool_1min_stats WHERE bucket_start >= $1`, [rangeStartMs]);
+      await c1.query(
+        `INSERT INTO pool_1min_stats (pool_address, chain, bucket_start, total_fees_usd, total_volume_usd, swap_count)
+         SELECT pool_address, chain, (timestamp/60000)*60000, COALESCE(SUM(fee_usd),0), COALESCE(SUM(volume_usd),0), COUNT(*)::int
+         FROM swaps WHERE timestamp >= $1
+         GROUP BY pool_address, chain, (timestamp/60000)*60000
+         ON CONFLICT (pool_address, chain, bucket_start) DO UPDATE SET
+           total_fees_usd = EXCLUDED.total_fees_usd,
+           total_volume_usd = EXCLUDED.total_volume_usd,
+           swap_count = EXCLUDED.swap_count`,
+        [rangeStartMs]
+      );
+      await c1.query("COMMIT");
+    } catch (e) {
+      await c1.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      c1.release();
+    }
+
+    const c2 = await getPool().connect();
+    try {
+      await c2.query("BEGIN");
+      await c2.query("LOCK TABLE token_1min_stats IN EXCLUSIVE MODE");
+      await c2.query(`DELETE FROM token_1min_stats WHERE bucket_start >= $1`, [rangeStartMs]);
+      await c2.query(
+        `WITH all_pools AS (
+           SELECT address AS pool_id, chain, LOWER(token0) AS t0, LOWER(token1) AS t1 FROM pools
+           UNION ALL
+           SELECT pool_id, chain, LOWER(currency0), LOWER(currency1) FROM v4_pools
+         ),
+         pool_target AS (
+           SELECT ap.pool_id, ap.chain, LOWER(bt.contract_address) AS target_token
+           FROM all_pools ap
+           JOIN binance_bsc_tokens bt
+             ON ap.t0 = LOWER(bt.contract_address) OR ap.t1 = LOWER(bt.contract_address)
+         )
+         INSERT INTO token_1min_stats (token_address, chain, bucket_start, total_volume_usd, total_fees_usd, swap_count)
+         SELECT pt.target_token, s.chain, (s.timestamp/60000)*60000,
+                COALESCE(SUM(s.volume_usd),0), COALESCE(SUM(s.fee_usd),0), COUNT(*)::int
+         FROM swaps s
+         JOIN pool_target pt ON pt.pool_id = s.pool_address AND pt.chain = s.chain
+         WHERE s.timestamp >= $1
+         GROUP BY pt.target_token, s.chain, (s.timestamp/60000)*60000
+         ON CONFLICT (token_address, chain, bucket_start) DO UPDATE SET
+           total_volume_usd = EXCLUDED.total_volume_usd,
+           total_fees_usd = EXCLUDED.total_fees_usd,
+           swap_count = EXCLUDED.swap_count`,
+        [rangeStartMs]
+      );
+      await c2.query("COMMIT");
+    } catch (e) {
+      await c2.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      c2.release();
+    }
     console.log("[Retry] buckets 重建完成 ✅");
   }
 
