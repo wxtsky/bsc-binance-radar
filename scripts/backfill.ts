@@ -67,6 +67,16 @@ async function main() {
   for (let from = start; from < latest; from += BLOCKS_PER_BATCH) {
     const to = from + BLOCKS_PER_BATCH - 1n > latest ? latest : from + BLOCKS_PER_BATCH - 1n;
 
+    // 拿 batch 起始 block 的真实时间，按 BSC 3s/block 推每条 log 的 timestamp
+    let fromBlockTs = 0;
+    try {
+      const blk = await httpClient.getBlock({ blockNumber: from });
+      fromBlockTs = Number(blk.timestamp) * 1000;
+    } catch (err) {
+      console.error(`[Backfill] getBlock ${from} failed:`, (err as Error).message);
+      continue;
+    }
+
     let v3: Log[] = [];
     let pancake: Log[] = [];
     let v4: Log[] = [];
@@ -89,10 +99,14 @@ async function main() {
     const batchTotal = v3.length + pancake.length + v4.length;
     totalLogs += batchTotal;
 
-    // 串行处理，让 token_1min_stats 累加 + getTokenPrices cache 受益
+    const tsForLog = (log: Log): number => {
+      const blockOffset = Number(log.blockNumber ?? from) - Number(from);
+      return fromBlockTs + blockOffset * BSC_BLOCK_TIME_S * 1000;
+    };
+
     for (const log of v3) {
       try {
-        await processV3SwapLog(log, "bsc", "uniswap-v3");
+        await processV3SwapLog(log, "bsc", "uniswap-v3", tsForLog(log));
         totalProcessed++;
       } catch {
         totalErrors++;
@@ -100,7 +114,7 @@ async function main() {
     }
     for (const log of pancake) {
       try {
-        await processV3SwapLog(log, "bsc", "pancakeswap-v3");
+        await processV3SwapLog(log, "bsc", "pancakeswap-v3", tsForLog(log));
         totalProcessed++;
       } catch {
         totalErrors++;
@@ -108,7 +122,7 @@ async function main() {
     }
     for (const log of v4) {
       try {
-        await processV4SwapLog(log, "bsc");
+        await processV4SwapLog(log, "bsc", tsForLog(log));
         totalProcessed++;
       } catch {
         totalErrors++;

@@ -209,7 +209,12 @@ function nonBaseToken(token0: string, token1: string, chain: ChainId): string | 
   return null;
 }
 
-export async function processV3SwapLog(log: Log, chain: ChainId, dex: DexType): Promise<void> {
+export async function processV3SwapLog(
+  log: Log,
+  chain: ChainId,
+  dex: DexType,
+  overrideTimestamp?: number
+): Promise<void> {
   try {
     const poolAddress = log.address.toLowerCase();
     const poolInfo = await getPoolInfo(poolAddress, chain, dex);
@@ -267,7 +272,7 @@ export async function processV3SwapLog(log: Log, chain: ChainId, dex: DexType): 
       return;
     }
 
-    const timestamp = Date.now();
+    const timestamp = overrideTimestamp ?? Date.now();
     const safeVolume = Number.isFinite(volumeUsd) ? volumeUsd : 0;
     const swap: SwapRecord = {
       poolAddress,
@@ -288,17 +293,23 @@ export async function processV3SwapLog(log: Log, chain: ChainId, dex: DexType): 
       upsertPool1minStat(poolAddress, chain, bucketStart, totalFeeUsd, safeVolume),
       upsertToken1minStat(target, chain, bucketStart, safeVolume, totalFeeUsd),
     ]);
-    swapEvents.emit("swap", { chain, token: target });
-
-    const symbol0 = prices.get(cacheKey0)?.symbol || "UNKNOWN";
-    const symbol1 = prices.get(cacheKey1)?.symbol || "UNKNOWN";
-    console.log(`[Radar] [${chain}] ${dex} ${symbol0}/${symbol1} fee=$${totalFeeUsd.toFixed(2)} vol=$${safeVolume.toFixed(0)}`);
+    if (overrideTimestamp === undefined) {
+      // 仅实时流 emit，避免 backfill 触发 livenessProbe markAlive
+      swapEvents.emit("swap", { chain, token: target });
+      const symbol0 = prices.get(cacheKey0)?.symbol || "UNKNOWN";
+      const symbol1 = prices.get(cacheKey1)?.symbol || "UNKNOWN";
+      console.log(`[Radar] [${chain}] ${dex} ${symbol0}/${symbol1} fee=$${totalFeeUsd.toFixed(2)} vol=$${safeVolume.toFixed(0)}`);
+    }
   } catch (error) {
     console.error("[Radar] Error processing V3 swap log:", error);
   }
 }
 
-export async function processV4SwapLog(log: Log, chain: ChainId): Promise<void> {
+export async function processV4SwapLog(
+  log: Log,
+  chain: ChainId,
+  overrideTimestamp?: number
+): Promise<void> {
   try {
     const poolId = log.topics[1];
     if (!poolId) return;
@@ -353,7 +364,7 @@ export async function processV4SwapLog(log: Log, chain: ChainId): Promise<void> 
       return;
     }
 
-    const timestamp = Date.now();
+    const timestamp = overrideTimestamp ?? Date.now();
     const safeVolume = Number.isFinite(volumeUsd) ? volumeUsd : 0;
     const swap: SwapRecord = {
       poolAddress: poolId,
@@ -374,11 +385,12 @@ export async function processV4SwapLog(log: Log, chain: ChainId): Promise<void> 
       upsertPool1minStat(poolId, chain, bucketStart, totalFeeUsd, safeVolume),
       upsertToken1minStat(target, chain, bucketStart, safeVolume, totalFeeUsd),
     ]);
-    swapEvents.emit("swap", { chain, token: target });
-
-    const symbol0 = prices.get(cacheKey0)?.symbol || "UNKNOWN";
-    const symbol1 = prices.get(cacheKey1)?.symbol || "UNKNOWN";
-    console.log(`[Radar] [${chain}] uniswap-v4 ${symbol0}/${symbol1} fee=$${totalFeeUsd.toFixed(2)} vol=$${safeVolume.toFixed(0)}`);
+    if (overrideTimestamp === undefined) {
+      swapEvents.emit("swap", { chain, token: target });
+      const symbol0 = prices.get(cacheKey0)?.symbol || "UNKNOWN";
+      const symbol1 = prices.get(cacheKey1)?.symbol || "UNKNOWN";
+      console.log(`[Radar] [${chain}] uniswap-v4 ${symbol0}/${symbol1} fee=$${totalFeeUsd.toFixed(2)} vol=$${safeVolume.toFixed(0)}`);
+    }
   } catch (error) {
     console.error("[Radar] Error processing V4 swap log:", error);
   }
