@@ -11,4 +11,6 @@ COPY package.json bun.lock ./
 COPY tsconfig.json ./
 COPY src ./src
 COPY db ./db
+COPY scripts ./scripts
+COPY seed ./seed
 CMD ["bun", "run", "src/index.ts"]

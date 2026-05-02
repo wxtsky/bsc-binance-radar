@@ -209,7 +209,7 @@ function nonBaseToken(token0: string, token1: string, chain: ChainId): string | 
   return null;
 }
 
-async function processV3SwapLog(log: Log, chain: ChainId, dex: DexType): Promise<void> {
+export async function processV3SwapLog(log: Log, chain: ChainId, dex: DexType): Promise<void> {
   try {
     const poolAddress = log.address.toLowerCase();
     const poolInfo = await getPoolInfo(poolAddress, chain, dex);
@@ -298,7 +298,7 @@ async function processV3SwapLog(log: Log, chain: ChainId, dex: DexType): Promise
   }
 }
 
-async function processV4SwapLog(log: Log, chain: ChainId): Promise<void> {
+export async function processV4SwapLog(log: Log, chain: ChainId): Promise<void> {
   try {
     const poolId = log.topics[1];
     if (!poolId) return;
