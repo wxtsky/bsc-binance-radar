@@ -21,9 +21,7 @@ import { startTokenTracker, stopTokenTracker } from "../src/token-tracker/tracke
 import { processV3SwapLog, processV4SwapLog } from "../src/core/swap-listener.js";
 
 const HOURS = Number(process.argv[2]) || 24;
-const BSC_BLOCK_TIME_S = 3;
 const BLOCKS_PER_BATCH = 1000n; // 保守，避免节点 timeout
-const TOTAL_BLOCKS = BigInt(Math.floor((HOURS * 3600) / BSC_BLOCK_TIME_S));
 
 const HTTP_URL = process.env.BSC_HTTP_URL || "http://151.123.172.62:81";
 
@@ -52,9 +50,22 @@ async function main() {
   });
 
   const latest = await httpClient.getBlockNumber();
+
+  // probe 真实 BSC 块时间（升级后 ~0.75s，常量推算会严重偏差）
+  const PROBE_DISTANCE = 1000n;
+  const [latestBlk, probeBlk] = await Promise.all([
+    httpClient.getBlock({ blockNumber: latest }),
+    httpClient.getBlock({ blockNumber: latest - PROBE_DISTANCE }),
+  ]);
+  const realBlockTimeS =
+    (Number(latestBlk.timestamp) - Number(probeBlk.timestamp)) / Number(PROBE_DISTANCE);
+  const TOTAL_BLOCKS = BigInt(Math.ceil((HOURS * 3600) / realBlockTimeS));
   const start = latest - TOTAL_BLOCKS;
   console.log(
-    `[Backfill] Block ${start} → ${latest} (${TOTAL_BLOCKS} blocks, batch ${BLOCKS_PER_BATCH})`
+    `[Backfill] Real block time ${realBlockTimeS.toFixed(3)}s; need ${TOTAL_BLOCKS} blocks for ${HOURS}h`
+  );
+  console.log(
+    `[Backfill] Block ${start} → ${latest} (batch ${BLOCKS_PER_BATCH})`
   );
 
   let totalLogs = 0;
@@ -67,13 +78,18 @@ async function main() {
   for (let from = start; from < latest; from += BLOCKS_PER_BATCH) {
     const to = from + BLOCKS_PER_BATCH - 1n > latest ? latest : from + BLOCKS_PER_BATCH - 1n;
 
-    // 拿 batch 起始 block 的真实时间，按 BSC 3s/block 推每条 log 的 timestamp
-    let fromBlockTs = 0;
+    // 拿 batch 两端 block 的真实时间，按 blockNumber 在 [from, to] 之间线性插值
+    let fromTs = 0;
+    let toTs = 0;
     try {
-      const blk = await httpClient.getBlock({ blockNumber: from });
-      fromBlockTs = Number(blk.timestamp) * 1000;
+      const [fb, tb] = await Promise.all([
+        httpClient.getBlock({ blockNumber: from }),
+        httpClient.getBlock({ blockNumber: to }),
+      ]);
+      fromTs = Number(fb.timestamp) * 1000;
+      toTs = Number(tb.timestamp) * 1000;
     } catch (err) {
-      console.error(`[Backfill] getBlock ${from} failed:`, (err as Error).message);
+      console.error(`[Backfill] getBlock ${from}/${to} failed:`, (err as Error).message);
       continue;
     }
 
@@ -100,8 +116,10 @@ async function main() {
     totalLogs += batchTotal;
 
     const tsForLog = (log: Log): number => {
-      const blockOffset = Number(log.blockNumber ?? from) - Number(from);
-      return fromBlockTs + blockOffset * BSC_BLOCK_TIME_S * 1000;
+      const blockNum = Number(log.blockNumber ?? from);
+      const range = Number(to - from) || 1;
+      const offset = blockNum - Number(from);
+      return Math.round(fromTs + (offset / range) * (toTs - fromTs));
     };
 
     for (const log of v3) {
