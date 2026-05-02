@@ -61,8 +61,13 @@ async function readOnChainSymbol(addr: string): Promise<string | null> {
   }
 }
 
-function symbolsEqual(a: string, b: string): boolean {
-  return a.trim().toUpperCase() === b.trim().toUpperCase();
+function symbolsEqual(onChain: string, expected: string): boolean {
+  const a = onChain.trim().toUpperCase();
+  const b = expected.trim().toUpperCase();
+  if (a === b) return true;
+  // 容忍 wrapped 前缀（IP→wIP, ROSE→wROSE）
+  if (a === "W" + b) return true;
+  return false;
 }
 
 async function reverifyMode() {
