@@ -1,0 +1,10 @@
+node_modules
+dist
+data
+.git
+.env
+.env.local
+.DS_Store
+*.log
+README.md
+HANDOFF.md

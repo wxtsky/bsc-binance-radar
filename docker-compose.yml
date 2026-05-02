@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: radar-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: radar
+      POSTGRES_USER: radar
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-radar}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      # 只绑 127.0.0.1，公网不暴露 PG（要远程查走 SSH 隧道）
+      - "127.0.0.1:${PG_HOST_PORT:-5434}:5432"
+    volumes:
+      - radar-pg-data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U radar -d radar"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  radar:
+    build: .
+    container_name: radar-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # 容器内走 docker 内部网络（service name），不依赖宿主端口
+      DATABASE_URL: postgresql://radar:${POSTGRES_PASSWORD:-radar}@postgres:5432/radar
+      BSC_WSS_URL: ${BSC_WSS_URL}
+      OKX_API_KEY: ${OKX_API_KEY}
+      OKX_SECRET_KEY: ${OKX_SECRET_KEY}
+      OKX_PASSPHRASE: ${OKX_PASSPHRASE}
+      ANOMALY_VOL_SPIKE_RATIO: ${ANOMALY_VOL_SPIKE_RATIO:-5}
+      ANOMALY_FEE_TVL_APR: ${ANOMALY_FEE_TVL_APR:-100}
+      ANOMALY_DETECT_INTERVAL_MS: ${ANOMALY_DETECT_INTERVAL_MS:-30000}
+      ANOMALY_COOLDOWN_MS: ${ANOMALY_COOLDOWN_MS:-300000}
+      ANOMALY_NEW_POOL_WINDOW_MS: ${ANOMALY_NEW_POOL_WINDOW_MS:-600000}
+      ANOMALY_BASELINE_MIN_COVERAGE_MS: ${ANOMALY_BASELINE_MIN_COVERAGE_MS:-3600000}
+
+volumes:
+  radar-pg-data:
