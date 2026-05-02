@@ -23,7 +23,3 @@ export function isWatchedToken(address: string): boolean {
 export function getWatchlistSize(): number {
   return watchedAddresses.size;
 }
-
-export function getWatchlist(): string[] {
-  return Array.from(watchedAddresses);
-}
