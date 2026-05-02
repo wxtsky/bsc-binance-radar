@@ -14,7 +14,7 @@
 import "dotenv/config";
 import { createPublicClient, http, parseAbiItem, type Log } from "viem";
 import { bsc } from "viem/chains";
-import { initSchema, closeDatabase } from "../src/db/index.js";
+import { getPool, initSchema, closeDatabase } from "../src/db/index.js";
 import { CONTRACTS } from "../src/config/contracts.js";
 import { initPriceService } from "../src/core/price-service.js";
 import { startTokenTracker, stopTokenTracker } from "../src/token-tracker/tracker.js";
@@ -67,6 +67,16 @@ async function main() {
   console.log(
     `[Backfill] Block ${start} → ${latest} (batch ${BLOCKS_PER_BATCH})`
   );
+
+  // 幂等保护：先清掉同时间范围已存在的桶 / swap，避免重跑时 ON CONFLICT 累加成双倍
+  const latestTsMs = Number(latestBlk.timestamp) * 1000;
+  const rangeStartMs = latestTsMs - HOURS * 3600 * 1000 - 60_000; // -60s buffer
+  console.log(
+    `[Backfill] Clearing existing buckets / swaps from ${new Date(rangeStartMs).toISOString()} (idempotent)`
+  );
+  await getPool().query(`DELETE FROM token_1min_stats WHERE bucket_start >= $1`, [rangeStartMs]);
+  await getPool().query(`DELETE FROM pool_1min_stats WHERE bucket_start >= $1`, [rangeStartMs]);
+  await getPool().query(`DELETE FROM swaps WHERE timestamp >= $1`, [rangeStartMs]);
 
   let totalLogs = 0;
   let totalProcessed = 0;
