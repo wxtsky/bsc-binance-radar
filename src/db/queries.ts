@@ -1,5 +1,162 @@
 import { getPool } from "./index.js";
-import type { ChainId, DexType, SwapRecord, PoolInfo, V4PoolTokenInfo, BinanceBscToken } from "../types/index.js";
+import type { ChainId, SwapRecord, PoolInfo, V4PoolTokenInfo, BinanceBscToken } from "../types/index.js";
+
+// ============================================================================
+// Batch helpers (backfill 用)
+// ============================================================================
+
+export interface BucketDelta {
+  key: string; // poolOrToken
+  chain: ChainId;
+  bucketStart: number;
+  feeUsd: number;
+  volumeUsd: number;
+  swapCount: number;
+}
+
+export interface BatchBuffer {
+  swaps: SwapRecord[];
+  poolDeltas: Map<string, BucketDelta>; // key: `${pool}|${chain}|${bucket}`
+  tokenDeltas: Map<string, BucketDelta>;
+}
+
+export function newBatchBuffer(): BatchBuffer {
+  return { swaps: [], poolDeltas: new Map(), tokenDeltas: new Map() };
+}
+
+export function bufferAddSwap(buf: BatchBuffer, swap: SwapRecord): void {
+  buf.swaps.push(swap);
+}
+
+export function bufferAddPoolBucket(
+  buf: BatchBuffer,
+  poolAddress: string,
+  chain: ChainId,
+  bucketStart: number,
+  feeUsd: number,
+  volumeUsd: number
+): void {
+  const key = `${poolAddress}|${chain}|${bucketStart}`;
+  const cur = buf.poolDeltas.get(key);
+  if (cur) {
+    cur.feeUsd += feeUsd;
+    cur.volumeUsd += volumeUsd;
+    cur.swapCount += 1;
+  } else {
+    buf.poolDeltas.set(key, {
+      key: poolAddress,
+      chain,
+      bucketStart,
+      feeUsd,
+      volumeUsd,
+      swapCount: 1,
+    });
+  }
+}
+
+export function bufferAddTokenBucket(
+  buf: BatchBuffer,
+  tokenAddress: string,
+  chain: ChainId,
+  bucketStart: number,
+  volumeUsd: number,
+  feeUsd: number
+): void {
+  const key = `${tokenAddress}|${chain}|${bucketStart}`;
+  const cur = buf.tokenDeltas.get(key);
+  if (cur) {
+    cur.feeUsd += feeUsd;
+    cur.volumeUsd += volumeUsd;
+    cur.swapCount += 1;
+  } else {
+    buf.tokenDeltas.set(key, {
+      key: tokenAddress,
+      chain,
+      bucketStart,
+      feeUsd,
+      volumeUsd,
+      swapCount: 1,
+    });
+  }
+}
+
+const SWAPS_CHUNK = 1000;
+const BUCKETS_CHUNK = 2000;
+
+async function bulkInsertSwaps(swaps: SwapRecord[]): Promise<void> {
+  for (let i = 0; i < swaps.length; i += SWAPS_CHUNK) {
+    const slice = swaps.slice(i, i + SWAPS_CHUNK);
+    const params: unknown[] = [];
+    const placeholders: string[] = [];
+    for (const s of slice) {
+      const base = params.length;
+      placeholders.push(
+        `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},$${base + 6},$${base + 7},$${base + 8},$${base + 9},$${base + 10})`
+      );
+      params.push(s.poolAddress, s.chain, s.dex, s.txHash, s.amount0, s.amount1, s.feeUsd, s.volumeUsd, s.timestamp, s.blockNumber);
+    }
+    await getPool().query(
+      `INSERT INTO swaps (pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number) VALUES ${placeholders.join(",")}`,
+      params
+    );
+  }
+}
+
+async function bulkUpsertPool1minStats(deltas: BucketDelta[]): Promise<void> {
+  for (let i = 0; i < deltas.length; i += BUCKETS_CHUNK) {
+    const slice = deltas.slice(i, i + BUCKETS_CHUNK);
+    const params: unknown[] = [];
+    const placeholders: string[] = [];
+    for (const d of slice) {
+      const base = params.length;
+      placeholders.push(
+        `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},$${base + 6})`
+      );
+      params.push(d.key, d.chain, d.bucketStart, d.feeUsd, d.volumeUsd, d.swapCount);
+    }
+    await getPool().query(
+      `INSERT INTO pool_1min_stats (pool_address, chain, bucket_start, total_fees_usd, total_volume_usd, swap_count)
+       VALUES ${placeholders.join(",")}
+       ON CONFLICT (pool_address, chain, bucket_start) DO UPDATE SET
+         total_fees_usd = pool_1min_stats.total_fees_usd + EXCLUDED.total_fees_usd,
+         total_volume_usd = pool_1min_stats.total_volume_usd + EXCLUDED.total_volume_usd,
+         swap_count = pool_1min_stats.swap_count + EXCLUDED.swap_count`,
+      params
+    );
+  }
+}
+
+async function bulkUpsertToken1minStats(deltas: BucketDelta[]): Promise<void> {
+  for (let i = 0; i < deltas.length; i += BUCKETS_CHUNK) {
+    const slice = deltas.slice(i, i + BUCKETS_CHUNK);
+    const params: unknown[] = [];
+    const placeholders: string[] = [];
+    for (const d of slice) {
+      const base = params.length;
+      placeholders.push(
+        `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},$${base + 6})`
+      );
+      params.push(d.key, d.chain, d.bucketStart, d.volumeUsd, d.feeUsd, d.swapCount);
+    }
+    await getPool().query(
+      `INSERT INTO token_1min_stats (token_address, chain, bucket_start, total_volume_usd, total_fees_usd, swap_count)
+       VALUES ${placeholders.join(",")}
+       ON CONFLICT (token_address, chain, bucket_start) DO UPDATE SET
+         total_volume_usd = token_1min_stats.total_volume_usd + EXCLUDED.total_volume_usd,
+         total_fees_usd = token_1min_stats.total_fees_usd + EXCLUDED.total_fees_usd,
+         swap_count = token_1min_stats.swap_count + EXCLUDED.swap_count`,
+      params
+    );
+  }
+}
+
+export async function flushBatchBuffer(buf: BatchBuffer): Promise<void> {
+  await Promise.all([
+    buf.swaps.length ? bulkInsertSwaps(buf.swaps) : Promise.resolve(),
+    buf.poolDeltas.size ? bulkUpsertPool1minStats([...buf.poolDeltas.values()]) : Promise.resolve(),
+    buf.tokenDeltas.size ? bulkUpsertToken1minStats([...buf.tokenDeltas.values()]) : Promise.resolve(),
+  ]);
+}
 
 // ============================================================================
 // Swap / pool persistence

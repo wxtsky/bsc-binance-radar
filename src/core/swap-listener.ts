@@ -16,6 +16,10 @@ import {
   getV4Pool,
   upsertPool1minStat,
   upsertToken1minStat,
+  bufferAddSwap,
+  bufferAddPoolBucket,
+  bufferAddTokenBucket,
+  type BatchBuffer,
 } from "../db/queries.js";
 import { getTokenPrices, getCacheKey } from "./price-service.js";
 import { isWatchedToken } from "../token-tracker/watchlist.js";
@@ -213,7 +217,8 @@ export async function processV3SwapLog(
   log: Log,
   chain: ChainId,
   dex: DexType,
-  overrideTimestamp?: number
+  overrideTimestamp?: number,
+  buffer?: BatchBuffer
 ): Promise<void> {
   try {
     const poolAddress = log.address.toLowerCase();
@@ -288,13 +293,18 @@ export async function processV3SwapLog(
     };
 
     const bucketStart = Math.floor(timestamp / 60_000) * 60_000;
-    await Promise.all([
-      insertSwap(swap),
-      upsertPool1minStat(poolAddress, chain, bucketStart, totalFeeUsd, safeVolume),
-      upsertToken1minStat(target, chain, bucketStart, safeVolume, totalFeeUsd),
-    ]);
+    if (buffer) {
+      bufferAddSwap(buffer, swap);
+      bufferAddPoolBucket(buffer, poolAddress, chain, bucketStart, totalFeeUsd, safeVolume);
+      bufferAddTokenBucket(buffer, target, chain, bucketStart, safeVolume, totalFeeUsd);
+    } else {
+      await Promise.all([
+        insertSwap(swap),
+        upsertPool1minStat(poolAddress, chain, bucketStart, totalFeeUsd, safeVolume),
+        upsertToken1minStat(target, chain, bucketStart, safeVolume, totalFeeUsd),
+      ]);
+    }
     if (overrideTimestamp === undefined) {
-      // 仅实时流 emit，避免 backfill 触发 livenessProbe markAlive
       swapEvents.emit("swap", { chain, token: target });
       const symbol0 = prices.get(cacheKey0)?.symbol || "UNKNOWN";
       const symbol1 = prices.get(cacheKey1)?.symbol || "UNKNOWN";
@@ -308,7 +318,8 @@ export async function processV3SwapLog(
 export async function processV4SwapLog(
   log: Log,
   chain: ChainId,
-  overrideTimestamp?: number
+  overrideTimestamp?: number,
+  buffer?: BatchBuffer
 ): Promise<void> {
   try {
     const poolId = log.topics[1];
@@ -380,11 +391,17 @@ export async function processV4SwapLog(
     };
 
     const bucketStart = Math.floor(timestamp / 60_000) * 60_000;
-    await Promise.all([
-      insertSwap(swap),
-      upsertPool1minStat(poolId, chain, bucketStart, totalFeeUsd, safeVolume),
-      upsertToken1minStat(target, chain, bucketStart, safeVolume, totalFeeUsd),
-    ]);
+    if (buffer) {
+      bufferAddSwap(buffer, swap);
+      bufferAddPoolBucket(buffer, poolId, chain, bucketStart, totalFeeUsd, safeVolume);
+      bufferAddTokenBucket(buffer, target, chain, bucketStart, safeVolume, totalFeeUsd);
+    } else {
+      await Promise.all([
+        insertSwap(swap),
+        upsertPool1minStat(poolId, chain, bucketStart, totalFeeUsd, safeVolume),
+        upsertToken1minStat(target, chain, bucketStart, safeVolume, totalFeeUsd),
+      ]);
+    }
     if (overrideTimestamp === undefined) {
       swapEvents.emit("swap", { chain, token: target });
       const symbol0 = prices.get(cacheKey0)?.symbol || "UNKNOWN";
