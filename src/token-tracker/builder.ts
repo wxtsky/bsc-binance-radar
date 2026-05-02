@@ -11,9 +11,8 @@ export interface BuildResult {
 }
 
 /**
- * 取交集：在币安 USDT-M 永续上有的币种 ∩ 币安 BSC 网络可充提的币种
- * 把交集结果（symbol → BSC 合约地址）写入 binance_bsc_tokens 表，
- * 然后重新 load watchlist。
+ * 取交集：币安 USDT-M 永续合约 baseAsset ∩ 币安 BSC 充提合约地址
+ * 把交集 (symbol → BSC 合约地址) 写入 binance_bsc_tokens 表，重新 load watchlist
  */
 export async function buildWatchlist(): Promise<BuildResult> {
   const [perpetuals, bscCoins] = await Promise.all([
@@ -24,8 +23,8 @@ export async function buildWatchlist(): Promise<BuildResult> {
   const intersection: string[] = [];
   const unmatched: string[] = [];
   const now = Date.now();
-
   const upserts: Promise<void>[] = [];
+
   for (const baseAsset of perpetuals) {
     const bsc = bscCoins.get(baseAsset);
     if (!bsc) {
@@ -38,7 +37,7 @@ export async function buildWatchlist(): Promise<BuildResult> {
         symbol: baseAsset,
         baseAsset,
         contractAddress: bsc.contractAddress,
-        decimals: 18, // 占位，真正定价时由 ERC20.decimals 链上读取并缓存
+        decimals: 18, // 占位，定价时由 ERC20.decimals 链上读取覆盖
         updatedAt: now,
       })
     );
