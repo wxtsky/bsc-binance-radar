@@ -1,4 +1,4 @@
-export type AnomalyRule = "vol_spike" | "fee_tvl_apr" | "combo" | "new_pool";
+export type AnomalyRule = "vol_spike" | "combo";
 
 export interface AnomalyMetrics {
   vol5minUsd?: number;
@@ -7,10 +7,6 @@ export interface AnomalyMetrics {
   fee5minUsd?: number;
   tvlUsd?: number;
   feeAprPct?: number;
-  newPoolAddress?: string;
-  newPoolDex?: string;
-  newPoolFeeTier?: number;
-  newPoolAgeMs?: number;
 }
 
 export interface AnomalyTrigger {
@@ -22,11 +18,10 @@ export interface AnomalyTrigger {
 }
 
 export interface AnomalyThresholds {
-  volSpikeRatio: number;        // ANOMALY_VOL_SPIKE_RATIO
-  feeAprPct: number;            // ANOMALY_FEE_TVL_APR (%)
+  volSpikeRatio: number;        // ANOMALY_VOL_SPIKE_RATIO  vol_spike 阈值
+  feeAprPct: number;            // ANOMALY_FEE_TVL_APR  combo 强信号需同时满足的 APR%
   detectIntervalMs: number;     // ANOMALY_DETECT_INTERVAL_MS
   cooldownMs: number;           // ANOMALY_COOLDOWN_MS
-  newPoolWindowMs: number;      // ANOMALY_NEW_POOL_WINDOW_MS
   baselineMinCoverageMs: number; // 数据覆盖少于此值时不触发 vol_spike，避免冷启动假阳
 }
 
@@ -36,7 +31,6 @@ export function loadThresholds(): AnomalyThresholds {
     feeAprPct: Number(process.env.ANOMALY_FEE_TVL_APR) || 100,
     detectIntervalMs: Number(process.env.ANOMALY_DETECT_INTERVAL_MS) || 30_000,
     cooldownMs: Number(process.env.ANOMALY_COOLDOWN_MS) || 5 * 60_000,
-    newPoolWindowMs: Number(process.env.ANOMALY_NEW_POOL_WINDOW_MS) || 10 * 60_000,
     baselineMinCoverageMs:
       Number(process.env.ANOMALY_BASELINE_MIN_COVERAGE_MS) || 60 * 60_000,
   };

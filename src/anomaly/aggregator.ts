@@ -103,38 +103,6 @@ export async function findTokenActivePools(
   return res.rows.map((r) => r.pool_address);
 }
 
-export interface NewPool {
-  address: string;
-  dex: string;
-  feeTier: number;
-  createdAt: number;
-  token0: string;
-  token1: string;
-}
-
-/** 找最近 windowMs 内首次出现的池子（白名单 token 涉及的） */
-export async function findNewlyCreatedPools(
-  windowMs: number,
-  chain: ChainId = "bsc"
-): Promise<NewPool[]> {
-  const cutoff = Date.now() - windowMs;
-  const res = await getPool().query<NewPool & { fee_tier: number; created_at: string }>(
-    `SELECT address, dex, fee_tier, created_at, token0, token1
-     FROM pools
-     WHERE chain = $1 AND created_at >= $2
-     ORDER BY created_at DESC`,
-    [chain, cutoff]
-  );
-  return res.rows.map((r) => ({
-    address: r.address,
-    dex: r.dex,
-    feeTier: r.fee_tier,
-    createdAt: Number(r.created_at),
-    token0: r.token0,
-    token1: r.token1,
-  }));
-}
-
 /** 查最近 cooldown 内同 token+rule 是否已经触发过 */
 export async function isRecentlyAlerted(
   tokenAddress: string,

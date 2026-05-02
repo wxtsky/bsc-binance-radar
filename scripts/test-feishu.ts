@@ -34,20 +34,6 @@ const samples: AnomalyTrigger[] = [
     },
   },
   {
-    rule: "fee_tvl_apr",
-    tokenAddress: "0xff7d6a96ae471bbcd7713af9cb1feeb16cf56b41",
-    symbol: "BR",
-    detectedAt: Date.now(),
-    metrics: {
-      vol5minUsd: 24,
-      vol24hAvg5minUsd: 199,
-      volRatio: 0.12,
-      fee5minUsd: 0.067,
-      tvlUsd: 2179,
-      feeAprPct: 322.8,
-    },
-  },
-  {
     rule: "combo",
     tokenAddress: "0x6d5ad1592ed9d6d1df9b93c793ab759573ed6714",
     symbol: "Broccoli",
@@ -59,18 +45,6 @@ const samples: AnomalyTrigger[] = [
       fee5minUsd: 21.17,
       tvlUsd: 1698000,
       feeAprPct: 131.0,
-    },
-  },
-  {
-    rule: "new_pool",
-    tokenAddress: "0x000ae314e2a2172a039b26378814c252734f556a",
-    symbol: "ASTER",
-    detectedAt: Date.now(),
-    metrics: {
-      newPoolAddress: "0xad26ebf44e6f57db393a054f2164fb7ac54609a4",
-      newPoolDex: "pancakeswap-v3",
-      newPoolFeeTier: 2500,
-      newPoolAgeMs: 8421,
     },
   },
 ];

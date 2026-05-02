@@ -16,42 +16,15 @@ function genSign(secret: string, timestamp: number): string {
 }
 
 function ruleEmoji(rule: AnomalyRule): string {
-  switch (rule) {
-    case "combo":
-      return "🔥";
-    case "vol_spike":
-      return "📈";
-    case "fee_tvl_apr":
-      return "💰";
-    case "new_pool":
-      return "🆕";
-  }
+  return rule === "combo" ? "🔥" : "📈";
 }
 
 function ruleTitle(rule: AnomalyRule): string {
-  switch (rule) {
-    case "combo":
-      return "异动强信号 (vol + fee/TVL)";
-    case "vol_spike":
-      return "成交量异动";
-    case "fee_tvl_apr":
-      return "fee/TVL APR 高位";
-    case "new_pool":
-      return "新池子诞生";
-  }
+  return rule === "combo" ? "异动强信号 (vol + fee/TVL)" : "成交量异动";
 }
 
 function ruleColor(rule: AnomalyRule): string {
-  switch (rule) {
-    case "combo":
-      return "red";
-    case "new_pool":
-      return "blue";
-    case "vol_spike":
-      return "orange";
-    case "fee_tvl_apr":
-      return "purple";
-  }
+  return rule === "combo" ? "red" : "orange";
 }
 
 function fmtUsd(v?: number): string {
@@ -85,17 +58,6 @@ function buildCard(t: AnomalyTrigger) {
       text: {
         tag: "lark_md",
         content: `**Fee/TVL 年化** ${fmtPct(m.feeAprPct, 0)}　**TVL** ${fmtUsd(m.tvlUsd)}　**5min Fee** ${fmtUsd(m.fee5minUsd)}`,
-      },
-    });
-  }
-  if (m.newPoolAddress) {
-    fields.push({
-      tag: "div",
-      text: {
-        tag: "lark_md",
-        content:
-          `**新池** ${m.newPoolDex} · fee=${(m.newPoolFeeTier ?? 0) / 10000}%\n` +
-          `[${m.newPoolAddress.slice(0, 10)}…](https://bscscan.com/address/${m.newPoolAddress})`,
       },
     });
   }
