@@ -7,7 +7,8 @@
     "start": "bun src/index.ts",
     "dev": "bun --watch src/index.ts",
     "build": "bun build src/index.ts --outdir dist --target bun",
-    "sync-perpetuals": "bun scripts/sync-perpetuals.ts"
+    "sync-perpetuals": "bun scripts/sync-perpetuals.ts",
+    "test-feishu": "bun scripts/test-feishu.ts"
   },
   "dependencies": {
     "dotenv": "^17.2.3",

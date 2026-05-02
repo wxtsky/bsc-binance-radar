@@ -7,6 +7,7 @@ import { CHAIN_CONFIGS, SUPPORTED_CHAINS } from "./config/chains.js";
 import { getWatchlistSize } from "./token-tracker/watchlist.js";
 import { startTokenTracker, stopTokenTracker } from "./token-tracker/tracker.js";
 import { startAnomalyDetector, stopAnomalyDetector } from "./anomaly/detector.js";
+import { startNotifier, stopNotifier } from "./notifier/index.js";
 import type { DexType } from "./types/index.js";
 
 const SUPPORTED_DEXES: DexType[] = ["uniswap-v3", "uniswap-v4", "pancakeswap-v3"];
@@ -46,6 +47,7 @@ async function main() {
   }
 
   startLivenessProbe();
+  startNotifier();
   startAnomalyDetector();
   console.log("[Radar] Ready");
 }
@@ -53,6 +55,7 @@ async function main() {
 async function shutdown(signal: string) {
   console.log(`[Radar] Received ${signal}, shutting down...`);
   stopAnomalyDetector();
+  stopNotifier();
   stopLivenessProbe();
   stopAllListeners();
   stopTokenTracker();
