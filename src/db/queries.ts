@@ -96,7 +96,9 @@ async function bulkInsertSwaps(swaps: SwapRecord[]): Promise<void> {
       params.push(s.poolAddress, s.chain, s.dex, s.txHash, s.amount0, s.amount1, s.feeUsd, s.volumeUsd, s.timestamp, s.blockNumber);
     }
     await getPool().query(
-      `INSERT INTO swaps (pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number) VALUES ${placeholders.join(",")}`,
+      `INSERT INTO swaps (pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number)
+       VALUES ${placeholders.join(",")}
+       ON CONFLICT (tx_hash, pool_address, amount0, amount1) DO NOTHING`,
       params
     );
   }
@@ -165,7 +167,8 @@ export async function flushBatchBuffer(buf: BatchBuffer): Promise<void> {
 export async function insertSwap(swap: SwapRecord): Promise<void> {
   await getPool().query(
     `INSERT INTO swaps (pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT (tx_hash, pool_address, amount0, amount1) DO NOTHING`,
     [
       swap.poolAddress,
       swap.chain,

@@ -44,6 +44,11 @@ CREATE INDEX IF NOT EXISTS idx_swaps_time ON swaps(timestamp);
 CREATE INDEX IF NOT EXISTS idx_swaps_chain_dex_time ON swaps(chain, dex, timestamp);
 CREATE INDEX IF NOT EXISTS idx_swaps_time_chain_valid
   ON swaps(timestamp, chain, dex) WHERE fee_usd > 0;
+-- 唯一约束：(tx_hash, pool_address, amount0, amount1) 是 EVM swap 在没存 log_index 情况下
+-- 实际可达的最稳定唯一标识。同一 tx 同一 pool 完全相同 amount 出现两次的概率几乎为 0。
+-- 配合 INSERT ... ON CONFLICT DO NOTHING 实现 backfill 与 stream 双写下的去重。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_swaps_dedup
+  ON swaps(tx_hash, pool_address, amount0, amount1);
 
 CREATE TABLE IF NOT EXISTS pool_1min_stats (
   pool_address TEXT NOT NULL,

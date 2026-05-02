@@ -6,13 +6,18 @@
  * - 批量 PG upsert（同 batch 内 (token, bucket) merge 后一次性 multi-row VALUES）
  * - batch 间并发 fetch + process（CONCURRENCY 个 worker）
  * - 块时间动态 probe，timestamp 线性插值
+ * - swaps 表 ON CONFLICT DO NOTHING（uq_swaps_dedup）防 stream + backfill 双写重复
+ * - backfill 跑完后从 swaps 表重建 token_1min_stats / pool_1min_stats，避免双累加
  *
  * 用法：
- *   bun scripts/backfill.ts [hours] [concurrency]
- *   bun scripts/backfill.ts 24 6
+ *   bun scripts/backfill.ts [duration] [concurrency]
+ *   bun scripts/backfill.ts 24       # 24 小时
+ *   bun scripts/backfill.ts 24h      # 24 小时
+ *   bun scripts/backfill.ts 30d      # 30 天 = 720 小时
+ *   bun scripts/backfill.ts 30d 8    # 30 天，8 并发 worker
  *
  * 容器内：
- *   docker compose run --rm --no-deps radar bun scripts/backfill.ts 24
+ *   docker compose run --rm --no-deps radar bun scripts/backfill.ts 30d
  */
 
 import "dotenv/config";
@@ -25,7 +30,15 @@ import { startTokenTracker, stopTokenTracker } from "../src/token-tracker/tracke
 import { processV3SwapLog, processV4SwapLog } from "../src/core/swap-listener.js";
 import { newBatchBuffer, flushBatchBuffer } from "../src/db/queries.js";
 
-const HOURS = Number(process.argv[2]) || 24;
+function parseDuration(s: string | undefined): number {
+  if (!s) return 24;
+  const m = /^(\d+)([hd])?$/i.exec(s);
+  if (!m) throw new Error(`Invalid duration: ${s}（应为 24, 24h, 30d 这样）`);
+  const n = Number(m[1]);
+  return (m[2] || "h").toLowerCase() === "d" ? n * 24 : n;
+}
+
+const HOURS = parseDuration(process.argv[2]);
 const CONCURRENCY = Number(process.argv[3]) || 6;
 const BLOCKS_PER_BATCH = 1000n;
 
@@ -158,13 +171,12 @@ async function main() {
     `[Backfill] block time ${realBlockTimeS.toFixed(3)}s; ${TOTAL_BLOCKS} blocks; range ${start} → ${latest}`
   );
 
-  // 幂等保护：清掉同时间范围已存在的桶 / swap
+  // 幂等保护：
+  //   swaps 表靠 uq_swaps_dedup 索引 + ON CONFLICT DO NOTHING（不再 DELETE）
+  //   pool/token 1min_stats 跑完后从 swaps 重建（不再依赖 backfill 中间累加状态）
   const latestTsMs = Number(latestBlk.timestamp) * 1000;
   const rangeStartMs = latestTsMs - HOURS * 3600 * 1000 - 60_000;
-  console.log(`[Backfill] Clearing buckets/swaps from ${new Date(rangeStartMs).toISOString()}`);
-  await getPool().query(`DELETE FROM token_1min_stats WHERE bucket_start >= $1`, [rangeStartMs]);
-  await getPool().query(`DELETE FROM pool_1min_stats WHERE bucket_start >= $1`, [rangeStartMs]);
-  await getPool().query(`DELETE FROM swaps WHERE timestamp >= $1`, [rangeStartMs]);
+  console.log(`[Backfill] 时间范围 ${new Date(rangeStartMs).toISOString()} → ${new Date(latestTsMs).toISOString()}`);
 
   // 切 jobs
   const jobs: BatchJob[] = [];
@@ -214,12 +226,80 @@ async function main() {
 
   const elapsedS = ((Date.now() - t0) / 1000).toFixed(0);
   console.log(
-    `[Backfill] Done in ${elapsedS}s — fetched ${totalLogs}, processed ${totalProcessed}, errors ${totalErrors}`
+    `[Backfill] swap 抓取完成 ${elapsedS}s — fetched ${totalLogs}, processed ${totalProcessed}, errors ${totalErrors}`
   );
+
+  // 跑完从 swaps 重建 buckets（彻底防 stream/backfill 双累加）
+  await rebuildBucketsFromSwaps(rangeStartMs);
 
   stopTokenTracker();
   await closeDatabase();
   process.exit(0);
+}
+
+/**
+ * 从 swaps 表完整重建 [rangeStartMs, +∞) 区间的 token_1min_stats / pool_1min_stats。
+ *
+ * - DELETE 该区间内已有 buckets（不动更早的）
+ * - GROUP BY 1min 桶，按 swaps.fee_usd / volume_usd 汇总
+ * - token-level：通过 pools / v4_pools JOIN binance_bsc_tokens 找出每个池子的 target token
+ *   （swap-listener 只把 swap 入库时已经过滤过白名单，这里直接 JOIN 即可）
+ */
+async function rebuildBucketsFromSwaps(rangeStartMs: number): Promise<void> {
+  console.log("[Backfill] 重建 buckets：DELETE 旧数据");
+  await getPool().query(`DELETE FROM token_1min_stats WHERE bucket_start >= $1`, [rangeStartMs]);
+  await getPool().query(`DELETE FROM pool_1min_stats WHERE bucket_start >= $1`, [rangeStartMs]);
+
+  console.log("[Backfill] 重建 pool_1min_stats");
+  const r1 = await getPool().query(
+    `INSERT INTO pool_1min_stats (pool_address, chain, bucket_start, total_fees_usd, total_volume_usd, swap_count)
+     SELECT
+       pool_address,
+       chain,
+       (timestamp / 60000) * 60000 AS bucket_start,
+       COALESCE(SUM(fee_usd), 0),
+       COALESCE(SUM(volume_usd), 0),
+       COUNT(*)::int
+     FROM swaps
+     WHERE timestamp >= $1
+     GROUP BY pool_address, chain, (timestamp / 60000) * 60000`,
+    [rangeStartMs]
+  );
+  console.log(`[Backfill]   pool_1min_stats inserted ${r1.rowCount}`);
+
+  console.log("[Backfill] 重建 token_1min_stats");
+  const r2 = await getPool().query(
+    `WITH all_pools AS (
+       SELECT address AS pool_id, chain, LOWER(token0) AS t0, LOWER(token1) AS t1 FROM pools
+       UNION ALL
+       SELECT pool_id, chain, LOWER(currency0), LOWER(currency1) FROM v4_pools
+     ),
+     pool_target AS (
+       SELECT
+         ap.pool_id,
+         ap.chain,
+         LOWER(bt.contract_address) AS target_token
+       FROM all_pools ap
+       JOIN binance_bsc_tokens bt
+         ON ap.t0 = LOWER(bt.contract_address)
+         OR ap.t1 = LOWER(bt.contract_address)
+     )
+     INSERT INTO token_1min_stats (token_address, chain, bucket_start, total_volume_usd, total_fees_usd, swap_count)
+     SELECT
+       pt.target_token,
+       s.chain,
+       (s.timestamp / 60000) * 60000 AS bucket_start,
+       COALESCE(SUM(s.volume_usd), 0),
+       COALESCE(SUM(s.fee_usd), 0),
+       COUNT(*)::int
+     FROM swaps s
+     JOIN pool_target pt ON pt.pool_id = s.pool_address AND pt.chain = s.chain
+     WHERE s.timestamp >= $1
+     GROUP BY pt.target_token, s.chain, (s.timestamp / 60000) * 60000`,
+    [rangeStartMs]
+  );
+  console.log(`[Backfill]   token_1min_stats inserted ${r2.rowCount}`);
+  console.log("[Backfill] buckets 重建完成 ✅");
 }
 
 main().catch((err) => {
