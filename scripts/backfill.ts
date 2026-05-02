@@ -3,43 +3,58 @@
  * 回补历史 swap 数据，让 detector 立刻有 baseline
  *
  * 用法：
- *   bun scripts/backfill.ts [hours]      # 默认 24，可传 4 / 6 / 12 等
+ *   bun scripts/backfill.ts [hours]      # 默认 24
  *
  * 容器内：
  *   docker compose run --rm --no-deps radar bun scripts/backfill.ts 4
+ *
+ * 注：WSS 不适合大范围 eth_getLogs（容易超时），用 HTTP RPC（BSC_HTTP_URL）。
  */
 
 import "dotenv/config";
-import type { Log } from "viem";
+import { createPublicClient, http, parseAbiItem, type Log } from "viem";
+import { bsc } from "viem/chains";
 import { initSchema, closeDatabase } from "../src/db/index.js";
-import { getClient } from "../src/clients/viem-clients.js";
 import { CONTRACTS } from "../src/config/contracts.js";
-import { UNISWAP_V4_POOL_MANAGER_ABI } from "../src/config/abis.js";
 import { initPriceService } from "../src/core/price-service.js";
 import { startTokenTracker, stopTokenTracker } from "../src/token-tracker/tracker.js";
 import { processV3SwapLog, processV4SwapLog } from "../src/core/swap-listener.js";
 
 const HOURS = Number(process.argv[2]) || 24;
 const BSC_BLOCK_TIME_S = 3;
-const BLOCKS_PER_BATCH = 5000n;
+const BLOCKS_PER_BATCH = 1000n; // 保守，避免节点 timeout
 const TOTAL_BLOCKS = BigInt(Math.floor((HOURS * 3600) / BSC_BLOCK_TIME_S));
 
-const V3_TOPIC = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67" as const;
-const PANCAKE_V3_TOPIC =
-  "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83" as const;
+const HTTP_URL = process.env.BSC_HTTP_URL || "http://151.123.172.62:81";
+
+// 三种 swap 事件 ABI（viem 用这个自动算 topic[0]）
+const V3_SWAP = parseAbiItem(
+  "event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)"
+);
+const PANCAKE_V3_SWAP = parseAbiItem(
+  "event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint128 protocolFeesToken0, uint128 protocolFeesToken1)"
+);
+const V4_SWAP = parseAbiItem(
+  "event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)"
+);
 
 async function main() {
-  console.log(`[Backfill] Starting backfill of ~${HOURS}h swap history...`);
+  console.log(`[Backfill] Starting ~${HOURS}h backfill via HTTP RPC ${HTTP_URL}`);
 
   await initSchema();
   await startTokenTracker();
   await initPriceService();
 
-  const client = getClient("bsc");
-  const latest = await client.getBlockNumber();
+  const httpClient = createPublicClient({
+    chain: bsc,
+    transport: http(HTTP_URL, { timeout: 30_000, retryCount: 2 }),
+    batch: { multicall: true },
+  });
+
+  const latest = await httpClient.getBlockNumber();
   const start = latest - TOTAL_BLOCKS;
   console.log(
-    `[Backfill] Block range ${start} → ${latest} (${TOTAL_BLOCKS.toString()} blocks, batch=${BLOCKS_PER_BATCH})`
+    `[Backfill] Block ${start} → ${latest} (${TOTAL_BLOCKS} blocks, batch ${BLOCKS_PER_BATCH})`
   );
 
   let totalLogs = 0;
@@ -57,23 +72,24 @@ async function main() {
     let v4: Log[] = [];
     try {
       [v3, pancake, v4] = await Promise.all([
-        client.getLogs({ fromBlock: from, toBlock: to, topics: [V3_TOPIC] }) as Promise<Log[]>,
-        client.getLogs({ fromBlock: from, toBlock: to, topics: [PANCAKE_V3_TOPIC] }) as Promise<Log[]>,
-        client.getLogs({
+        httpClient.getLogs({ fromBlock: from, toBlock: to, event: V3_SWAP }) as unknown as Promise<Log[]>,
+        httpClient.getLogs({ fromBlock: from, toBlock: to, event: PANCAKE_V3_SWAP }) as unknown as Promise<Log[]>,
+        httpClient.getLogs({
           address: v4PoolManager,
           fromBlock: from,
           toBlock: to,
-          event: UNISWAP_V4_POOL_MANAGER_ABI[0],
+          event: V4_SWAP,
         }) as unknown as Promise<Log[]>,
       ]);
     } catch (err) {
-      console.error(`[Backfill] getLogs failed for ${from}-${to}:`, (err as Error).message);
+      console.error(`[Backfill] getLogs ${from}-${to} failed:`, (err as Error).message);
       continue;
     }
 
     const batchTotal = v3.length + pancake.length + v4.length;
     totalLogs += batchTotal;
 
+    // 串行处理，让 token_1min_stats 累加 + getTokenPrices cache 受益
     for (const log of v3) {
       try {
         await processV3SwapLog(log, "bsc", "uniswap-v3");
@@ -102,7 +118,7 @@ async function main() {
     const pct = Number(((to - start) * 100n) / (latest - start));
     const elapsedS = ((Date.now() - t0) / 1000).toFixed(0);
     console.log(
-      `[Backfill] ${pct}% (block ${to}) batch ${batchTotal} | total fetched=${totalLogs} ok=${totalProcessed} err=${totalErrors} | ${elapsedS}s`
+      `[Backfill] ${pct}% block ${to} batch ${batchTotal} | total ${totalLogs} ok ${totalProcessed} err ${totalErrors} | ${elapsedS}s`
     );
   }
 
