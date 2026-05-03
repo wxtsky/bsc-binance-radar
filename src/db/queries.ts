@@ -88,26 +88,47 @@ export function bufferAddTokenBucket(
   }
 }
 
-const SWAPS_CHUNK = 1000;
+// pg-node bind 协议有 16-bit (≤32767) 参数上限。多行 placeholder 写法
+// (row × col) 在 30k row × 10 col 时撞限。改用 unnest(arr1, arr2, ...) —
+// 固定 N 个 array 参数（N=列数），单次 INSERT 可一口气塞数十万行，避免
+// 拆 chunk 多 round-trip。
+const SWAPS_UNNEST_CHUNK = 30000;
 const BUCKETS_CHUNK = 2000;
 
 async function bulkInsertSwaps(swaps: SwapRecord[]): Promise<void> {
-  for (let i = 0; i < swaps.length; i += SWAPS_CHUNK) {
-    const slice = swaps.slice(i, i + SWAPS_CHUNK);
-    const params: unknown[] = [];
-    const placeholders: string[] = [];
+  for (let i = 0; i < swaps.length; i += SWAPS_UNNEST_CHUNK) {
+    const slice = swaps.slice(i, i + SWAPS_UNNEST_CHUNK);
+    const poolAddrs: string[] = [];
+    const chains: string[] = [];
+    const dexes: string[] = [];
+    const txHashes: string[] = [];
+    const amount0s: string[] = [];
+    const amount1s: string[] = [];
+    const feeUsds: number[] = [];
+    const volumeUsds: number[] = [];
+    const timestamps: string[] = [];
+    const blockNumbers: string[] = [];
     for (const s of slice) {
-      const base = params.length;
-      placeholders.push(
-        `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},$${base + 6},$${base + 7},$${base + 8},$${base + 9},$${base + 10})`
-      );
-      params.push(s.poolAddress, s.chain, s.dex, s.txHash, s.amount0, s.amount1, s.feeUsd, s.volumeUsd, s.timestamp, s.blockNumber);
+      poolAddrs.push(s.poolAddress);
+      chains.push(s.chain);
+      dexes.push(s.dex);
+      txHashes.push(s.txHash);
+      amount0s.push(s.amount0);
+      amount1s.push(s.amount1);
+      feeUsds.push(s.feeUsd);
+      volumeUsds.push(s.volumeUsd);
+      // bigint 列用 string 传，避免 pg-node Number 精度丢失
+      timestamps.push(String(s.timestamp));
+      blockNumbers.push(String(s.blockNumber));
     }
     await getPool().query(
       `INSERT INTO swaps (pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number)
-       VALUES ${placeholders.join(",")}
+       SELECT * FROM unnest(
+         $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+         $7::float8[], $8::float8[], $9::bigint[], $10::bigint[]
+       )
        ON CONFLICT (tx_hash, pool_address, amount0, amount1) DO NOTHING`,
-      params
+      [poolAddrs, chains, dexes, txHashes, amount0s, amount1s, feeUsds, volumeUsds, timestamps, blockNumbers]
     );
   }
 }
