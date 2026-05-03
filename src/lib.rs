@@ -6,6 +6,7 @@ pub mod contracts;
 pub mod db;
 pub mod discovery;
 pub mod notifier;
+pub mod stream_listener;
 pub mod swap_processor;
 pub mod token_tracker;
 pub mod types;
