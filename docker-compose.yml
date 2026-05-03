@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:17-alpine
+    image: timescale/timescaledb:latest-pg17
     container_name: radar-pg
     restart: unless-stopped
     # 调优：服务器 7.8GB RAM，数据库 ~50GB；shared_buffers 2GB 让索引基本 cache 内存

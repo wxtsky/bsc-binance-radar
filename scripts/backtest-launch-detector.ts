@@ -29,6 +29,7 @@ interface Thresholds {
   priceChangePct: number;
   buyRatio: number;
   baselineMinutes: number;
+  cooldownMinutes: number; // 同 token 多久内不再告警（0 = 不限）
 }
 
 const DEFAULT_THRESHOLDS: Thresholds = {
@@ -37,6 +38,7 @@ const DEFAULT_THRESHOLDS: Thresholds = {
   priceChangePct: Number(process.env.BT_PRICE_PCT) || 1.0,
   buyRatio: Number(process.env.BT_BUY_RATIO) || 0.8,
   baselineMinutes: Number(process.env.BT_BASELINE_MIN) || 30,
+  cooldownMinutes: Number(process.env.BT_COOLDOWN_MIN) || 0,
 };
 
 const ONE_MIN_MS = 60 * 1000;
@@ -321,9 +323,17 @@ async function runForToken(
 
   const alerts: Alert[] = [];
   const debugAroundMs = process.env.BT_DEBUG_AROUND_MS ? Number(process.env.BT_DEBUG_AROUND_MS) : 0;
+  const cooldownMs = thresholds.cooldownMinutes * ONE_MIN_MS;
+  let lastAlertMs = -Infinity;
   for (const f of series) {
     if (decideAlert(f, thresholds)) {
-      alerts.push({ cnTime: fmtCn(f.bucketStart), bucketStart: f.bucketStart, features: f });
+      // cooldown：同 token 上次告警以来未达冷静期 → 跳过
+      if (cooldownMs > 0 && f.bucketStart - lastAlertMs < cooldownMs) {
+        // skip
+      } else {
+        alerts.push({ cnTime: fmtCn(f.bucketStart), bucketStart: f.bucketStart, features: f });
+        lastAlertMs = f.bucketStart;
+      }
     }
     // 调试：dump 指定时间点 ± 10min 的所有桶特征
     if (debugAroundMs > 0 && Math.abs(f.bucketStart - debugAroundMs) <= 10 * ONE_MIN_MS) {
