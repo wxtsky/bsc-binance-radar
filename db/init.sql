@@ -47,8 +47,8 @@ CREATE TABLE IF NOT EXISTS swaps (
   chain SMALLINT NOT NULL,
   dex SMALLINT NOT NULL,
   tx_hash BYTEA NOT NULL,        -- 32 bytes
-  amount0 NUMERIC NOT NULL,      -- signed int256 / int128
-  amount1 NUMERIC NOT NULL,
+  amount0 BYTEA NOT NULL,        -- 32 bytes (I256 big-endian signed)
+  amount1 BYTEA NOT NULL,
   fee_usd DOUBLE PRECISION NOT NULL,
   volume_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
   timestamp BIGINT NOT NULL,

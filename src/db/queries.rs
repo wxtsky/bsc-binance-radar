@@ -237,8 +237,8 @@ pub async fn create_staging_table() -> Result<()> {
             chain SMALLINT NOT NULL,
             dex SMALLINT NOT NULL,
             tx_hash BYTEA NOT NULL,
-            amount0 NUMERIC NOT NULL,
-            amount1 NUMERIC NOT NULL,
+            amount0 BYTEA NOT NULL,
+            amount1 BYTEA NOT NULL,
             fee_usd DOUBLE PRECISION NOT NULL,
             volume_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
             timestamp BIGINT NOT NULL,
@@ -248,47 +248,49 @@ pub async fn create_staging_table() -> Result<()> {
     Ok(())
 }
 
-/// I256 → PG NUMERIC（带符号 decimal）
-fn i256_to_numeric_str(v: I256) -> String {
-    v.to_string()
-}
-
-/// 批量写 swaps_staging（unnest INSERT，因为 NUMERIC 类型 binary COPY 没 alloy I256 直接支持）
+/// 批量写 swaps_staging（binary COPY 协议，所有列原生 binary 支持）
 pub async fn bulk_insert_swaps_staging(swaps: &[SwapRecord]) -> Result<()> {
     if swaps.is_empty() {
         return Ok(());
     }
     let client = get_pool().get().await?;
+    let sink = client.copy_in(
+        "COPY swaps_staging (pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number) FROM STDIN BINARY"
+    ).await?;
+    let writer = BinaryCopyInWriter::new(
+        sink,
+        &[
+            Type::BYTEA, Type::INT2, Type::INT2, Type::BYTEA,
+            Type::BYTEA, Type::BYTEA,           // amount0/1 改 BYTEA(32) i256 raw
+            Type::FLOAT8, Type::FLOAT8,
+            Type::INT8, Type::INT8,
+        ],
+    );
+    pin_mut!(writer);
 
-    for chunk in swaps.chunks(5000) {
-        // tokio_postgres 不能 serialize Vec<&[u8]> → bytea[]，要 owned Vec<Vec<u8>>
-        let pool_addrs: Vec<Vec<u8>> = chunk.iter().map(|s| s.pool_address.clone()).collect();
-        let chains: Vec<i16> = chunk.iter().map(|s| s.chain).collect();
-        let dexs: Vec<i16> = chunk.iter().map(|s| s.dex.as_db_smallint()).collect();
-        let tx_hashes: Vec<Vec<u8>> = chunk.iter().map(|s| s.tx_hash.as_slice().to_vec()).collect();
-        let amount0s: Vec<String> = chunk.iter().map(|s| s.amount0.to_string()).collect();
-        let amount1s: Vec<String> = chunk.iter().map(|s| s.amount1.to_string()).collect();
-        let fee_usds: Vec<f64> = chunk.iter().map(|s| s.fee_usd).collect();
-        let vol_usds: Vec<f64> = chunk.iter().map(|s| s.volume_usd).collect();
-        let timestamps: Vec<i64> = chunk.iter().map(|s| s.timestamp).collect();
-        let blocks: Vec<i64> = chunk.iter().map(|s| s.block_number).collect();
+    for s in swaps {
+        let dex_smallint = s.dex.as_db_smallint();
+        let amount0_bytes = s.amount0.to_be_bytes::<32>();
+        let amount1_bytes = s.amount1.to_be_bytes::<32>();
+        let pool_addr_slice: &[u8] = s.pool_address.as_slice();
+        let tx_hash_slice: &[u8] = s.tx_hash.as_slice();
+        let amount0_slice: &[u8] = &amount0_bytes;
+        let amount1_slice: &[u8] = &amount1_bytes;
 
-        client.execute(
-            "INSERT INTO swaps_staging (pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number)
-             SELECT * FROM unnest(
-               $1::bytea[], $2::int2[], $3::int2[], $4::bytea[],
-               $5::numeric[], $6::numeric[],
-               $7::float8[], $8::float8[],
-               $9::int8[], $10::int8[]
-             )",
-            &[
-                &pool_addrs, &chains, &dexs, &tx_hashes,
-                &amount0s, &amount1s,
-                &fee_usds, &vol_usds,
-                &timestamps, &blocks,
-            ],
-        ).await?;
+        writer.as_mut().write(&[
+            &pool_addr_slice,
+            &s.chain,
+            &dex_smallint,
+            &tx_hash_slice,
+            &amount0_slice,
+            &amount1_slice,
+            &s.fee_usd,
+            &s.volume_usd,
+            &s.timestamp,
+            &s.block_number,
+        ]).await?;
     }
+    writer.finish().await?;
     Ok(())
 }
 
