@@ -72,7 +72,14 @@ const V2_SWAP = parseAbiItem(
 
 const httpClient = createPublicClient({
   chain: bsc,
-  transport: http(HTTP_URL, { timeout: 30_000, retryCount: 2 }),
+  // batch.wait=16ms 内发起的所有 RPC 调用合并到 1 个 HTTP request（JSON-RPC batch），
+  // batchSize=1000 单 batch 上限。配合 client.batch.multicall（合约层 batch）用。
+  // 这是降低节点连接数 + 网络 overhead 的关键，对 8+ worker 并发场景特别有效。
+  transport: http(HTTP_URL, {
+    timeout: 30_000,
+    retryCount: 2,
+    batch: { wait: 16, batchSize: 1000 },
+  }),
   batch: { multicall: true },
 });
 
