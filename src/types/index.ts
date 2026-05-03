@@ -1,5 +1,9 @@
 export type ChainId = "bsc";
-export type DexType = "uniswap-v3" | "uniswap-v4" | "pancakeswap-v3";
+export type DexType =
+  | "uniswap-v3"
+  | "uniswap-v4"
+  | "pancakeswap-v3"
+  | "pancakeswap-v4-cl";
 
 export interface PoolInfo {
   address: string;
@@ -52,6 +56,10 @@ export interface ContractAddresses {
   uniswapV4PoolManager: string;
   uniswapV4PositionManager: string;
   pancakeswapV3Factory: string;
+  pancakeswapV4ClPoolManager: string;
+  pancakeswapV4ClPositionManager: string;
+  // 价格基准池（base-pair pool），仅作 BNB/USD 历史价的数据源
+  bnbPricePool: string;
 }
 
 export interface BinanceBscToken {

@@ -90,3 +90,17 @@ CREATE TABLE IF NOT EXISTS anomaly_events (
 );
 CREATE INDEX IF NOT EXISTS idx_anomaly_events_token_time
   ON anomaly_events(token_address, detected_at);
+
+-- BNB/USD 历史价：单独表，由 PancakeV2 WBNB/USDT 池（CONTRACTS.bsc.bnbPricePool）的
+-- 每笔 swap 反算得出。给非 USDT 池的 swap 重算 volume_usd 时按 timestamp 二分查找。
+CREATE TABLE IF NOT EXISTS bnb_price_history (
+  timestamp BIGINT NOT NULL,
+  price_usd DOUBLE PRECISION NOT NULL,
+  block_number BIGINT NOT NULL,
+  tx_hash TEXT NOT NULL,
+  log_index INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_bnb_price_time ON bnb_price_history(timestamp);
+-- 同一 tx 可能有多笔 swap（multi-hop），用 tx_hash + log_index 去重
+CREATE UNIQUE INDEX IF NOT EXISTS uq_bnb_price_dedup
+  ON bnb_price_history(tx_hash, log_index);

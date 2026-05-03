@@ -27,7 +27,12 @@ import { getPool, initSchema, closeDatabase } from "../src/db/index.js";
 import { CONTRACTS } from "../src/config/contracts.js";
 import { initPriceService } from "../src/core/price-service.js";
 import { startTokenTracker, stopTokenTracker } from "../src/token-tracker/tracker.js";
-import { processV3SwapLog, processV4SwapLog } from "../src/core/swap-listener.js";
+import {
+  processV3SwapLog,
+  processV4SwapLog,
+  processPcsV4ClSwapLog,
+  processV2BnbPriceSwap,
+} from "../src/core/swap-listener.js";
 import { newBatchBuffer, flushBatchBuffer } from "../src/db/queries.js";
 
 function parseDuration(s: string | undefined): number {
@@ -53,6 +58,12 @@ const PANCAKE_V3_SWAP = parseAbiItem(
 const V4_SWAP = parseAbiItem(
   "event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)"
 );
+const PCS_V4_CL_SWAP = parseAbiItem(
+  "event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee, uint16 protocolFee)"
+);
+const V2_SWAP = parseAbiItem(
+  "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)"
+);
 
 const httpClient = createPublicClient({
   chain: bsc,
@@ -68,7 +79,9 @@ interface BatchJob {
 
 async function processOneBatch(
   job: BatchJob,
-  v4PoolManager: `0x${string}`
+  v4PoolManager: `0x${string}`,
+  pcsV4ClPoolManager: `0x${string}`,
+  bnbPricePool: `0x${string}`
 ): Promise<{ logs: number; processed: number; errors: number }> {
   const { from, to } = job;
 
@@ -88,8 +101,10 @@ async function processOneBatch(
   let v3: Log[] = [];
   let pancake: Log[] = [];
   let v4: Log[] = [];
+  let pcsV4Cl: Log[] = [];
+  let bnbV2: Log[] = [];
   try {
-    [v3, pancake, v4] = await Promise.all([
+    [v3, pancake, v4, pcsV4Cl, bnbV2] = await Promise.all([
       httpClient.getLogs({ fromBlock: from, toBlock: to, event: V3_SWAP }) as unknown as Promise<Log[]>,
       httpClient.getLogs({ fromBlock: from, toBlock: to, event: PANCAKE_V3_SWAP }) as unknown as Promise<Log[]>,
       httpClient.getLogs({
@@ -98,12 +113,24 @@ async function processOneBatch(
         toBlock: to,
         event: V4_SWAP,
       }) as unknown as Promise<Log[]>,
+      httpClient.getLogs({
+        address: pcsV4ClPoolManager,
+        fromBlock: from,
+        toBlock: to,
+        event: PCS_V4_CL_SWAP,
+      }) as unknown as Promise<Log[]>,
+      httpClient.getLogs({
+        address: bnbPricePool,
+        fromBlock: from,
+        toBlock: to,
+        event: V2_SWAP,
+      }) as unknown as Promise<Log[]>,
     ]);
   } catch (err) {
     throw new Error(`getLogs ${from}-${to}: ${(err as Error).message}`);
   }
 
-  const logCount = v3.length + pancake.length + v4.length;
+  const logCount = v3.length + pancake.length + v4.length + pcsV4Cl.length + bnbV2.length;
   const buffer = newBatchBuffer();
 
   const tsForLog = (log: Log): number => {
@@ -136,6 +163,22 @@ async function processOneBatch(
   for (const log of v4) {
     try {
       await processV4SwapLog(log, "bsc", tsForLog(log), buffer);
+      processed++;
+    } catch {
+      errors++;
+    }
+  }
+  for (const log of pcsV4Cl) {
+    try {
+      await processPcsV4ClSwapLog(log, "bsc", tsForLog(log), buffer);
+      processed++;
+    } catch {
+      errors++;
+    }
+  }
+  for (const log of bnbV2) {
+    try {
+      await processV2BnbPriceSwap(log, "bsc", tsForLog(log), buffer);
       processed++;
     } catch {
       errors++;
@@ -188,6 +231,8 @@ async function main() {
   console.log(`[Backfill] ${jobs.length} batches`);
 
   const v4PoolManager = CONTRACTS.bsc.uniswapV4PoolManager as `0x${string}`;
+  const pcsV4ClPoolManager = CONTRACTS.bsc.pancakeswapV4ClPoolManager as `0x${string}`;
+  const bnbPricePool = CONTRACTS.bsc.bnbPricePool as `0x${string}`;
 
   // worker pool
   const queue = [...jobs];
@@ -202,7 +247,7 @@ async function main() {
       const job = queue.shift();
       if (!job) break;
       try {
-        const r = await processOneBatch(job, v4PoolManager);
+        const r = await processOneBatch(job, v4PoolManager, pcsV4ClPoolManager, bnbPricePool);
         totalLogs += r.logs;
         totalProcessed += r.processed;
         totalErrors += r.errors;

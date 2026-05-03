@@ -6,5 +6,7 @@ data/
 .DS_Store
 *.log
 backtest-phase*.json
+launch-tops-analysis.json
 backups/
+.claude/
 .gitignore.new

@@ -1,7 +1,11 @@
 import "dotenv/config";
 import { initSchema, closeDatabase } from "./db/index.js";
 import { initPriceService } from "./core/price-service.js";
-import { startSwapListener, stopAllListeners } from "./core/swap-listener.js";
+import {
+  startSwapListener,
+  startBnbPriceListener,
+  stopAllListeners,
+} from "./core/swap-listener.js";
 import { startLivenessProbe, stopLivenessProbe } from "./core/livenessProbe.js";
 import { CHAIN_CONFIGS, SUPPORTED_CHAINS } from "./config/chains.js";
 import { getWatchlistSize } from "./token-tracker/watchlist.js";
@@ -10,7 +14,12 @@ import { startAnomalyDetector, stopAnomalyDetector } from "./anomaly/detector.js
 import { startNotifier, stopNotifier } from "./notifier/index.js";
 import type { DexType } from "./types/index.js";
 
-const SUPPORTED_DEXES: DexType[] = ["uniswap-v3", "uniswap-v4", "pancakeswap-v3"];
+const SUPPORTED_DEXES: DexType[] = [
+  "uniswap-v3",
+  "uniswap-v4",
+  "pancakeswap-v3",
+  "pancakeswap-v4-cl",
+];
 
 async function main() {
   if (!CHAIN_CONFIGS.bsc.wssUrl) {
@@ -43,6 +52,12 @@ async function main() {
       } catch (err) {
         console.error(`[Radar] Failed to start ${chain} ${dex} listener:`, err);
       }
+    }
+    // 单池 BNB 价基准监听
+    try {
+      await startBnbPriceListener(chain);
+    } catch (err) {
+      console.error(`[Radar] Failed to start BNB price listener for ${chain}:`, err);
     }
   }
 

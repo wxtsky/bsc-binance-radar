@@ -24,7 +24,12 @@ import { initSchema, closeDatabase, getPool } from "../src/db/index.js";
 import { CONTRACTS } from "../src/config/contracts.js";
 import { initPriceService } from "../src/core/price-service.js";
 import { startTokenTracker, stopTokenTracker } from "../src/token-tracker/tracker.js";
-import { processV3SwapLog, processV4SwapLog } from "../src/core/swap-listener.js";
+import {
+  processV3SwapLog,
+  processV4SwapLog,
+  processPcsV4ClSwapLog,
+  processV2BnbPriceSwap,
+} from "../src/core/swap-listener.js";
 import { newBatchBuffer, flushBatchBuffer } from "../src/db/queries.js";
 
 const HTTP_URL = process.env.BSC_HTTP_URL || "http://151.123.172.62:81";
@@ -37,6 +42,12 @@ const PANCAKE_V3_SWAP = parseAbiItem(
 );
 const V4_SWAP = parseAbiItem(
   "event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)"
+);
+const PCS_V4_CL_SWAP = parseAbiItem(
+  "event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee, uint16 protocolFee)"
+);
+const V2_SWAP = parseAbiItem(
+  "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)"
 );
 
 const httpClient = createPublicClient({
@@ -69,7 +80,9 @@ async function processRange(range: Range, v4PoolManager: `0x${string}`): Promise
   const fromTs = Number(fb.timestamp) * 1000;
   const toTs = Number(tb.timestamp) * 1000;
 
-  const [v3, pancake, v4] = await Promise.all([
+  const pcsV4ClPoolManager = CONTRACTS.bsc.pancakeswapV4ClPoolManager as `0x${string}`;
+  const bnbPricePool = CONTRACTS.bsc.bnbPricePool as `0x${string}`;
+  const [v3, pancake, v4, pcsV4Cl, bnbV2] = await Promise.all([
     httpClient.getLogs({ fromBlock: from, toBlock: to, event: V3_SWAP }) as unknown as Promise<Log[]>,
     httpClient.getLogs({ fromBlock: from, toBlock: to, event: PANCAKE_V3_SWAP }) as unknown as Promise<Log[]>,
     httpClient.getLogs({
@@ -77,6 +90,18 @@ async function processRange(range: Range, v4PoolManager: `0x${string}`): Promise
       fromBlock: from,
       toBlock: to,
       event: V4_SWAP,
+    }) as unknown as Promise<Log[]>,
+    httpClient.getLogs({
+      address: pcsV4ClPoolManager,
+      fromBlock: from,
+      toBlock: to,
+      event: PCS_V4_CL_SWAP,
+    }) as unknown as Promise<Log[]>,
+    httpClient.getLogs({
+      address: bnbPricePool,
+      fromBlock: from,
+      toBlock: to,
+      event: V2_SWAP,
     }) as unknown as Promise<Log[]>,
   ]);
 
@@ -109,6 +134,22 @@ async function processRange(range: Range, v4PoolManager: `0x${string}`): Promise
   for (const log of v4) {
     try {
       await processV4SwapLog(log, "bsc", tsForLog(log), buffer);
+      processed++;
+    } catch {
+      errors++;
+    }
+  }
+  for (const log of pcsV4Cl) {
+    try {
+      await processPcsV4ClSwapLog(log, "bsc", tsForLog(log), buffer);
+      processed++;
+    } catch {
+      errors++;
+    }
+  }
+  for (const log of bnbV2) {
+    try {
+      await processV2BnbPriceSwap(log, "bsc", tsForLog(log), buffer);
       processed++;
     } catch {
       errors++;

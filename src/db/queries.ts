@@ -18,14 +18,22 @@ export interface BatchBuffer {
   swaps: SwapRecord[];
   poolDeltas: Map<string, BucketDelta>; // key: `${pool}|${chain}|${bucket}`
   tokenDeltas: Map<string, BucketDelta>;
+  bnbPrices: import("./queries.js").BnbPriceRecord[];
 }
 
 export function newBatchBuffer(): BatchBuffer {
-  return { swaps: [], poolDeltas: new Map(), tokenDeltas: new Map() };
+  return { swaps: [], poolDeltas: new Map(), tokenDeltas: new Map(), bnbPrices: [] };
 }
 
 export function bufferAddSwap(buf: BatchBuffer, swap: SwapRecord): void {
   buf.swaps.push(swap);
+}
+
+export function bufferAddBnbPrice(
+  buf: BatchBuffer,
+  rec: import("./queries.js").BnbPriceRecord
+): void {
+  buf.bnbPrices.push(rec);
 }
 
 export function bufferAddPoolBucket(
@@ -157,6 +165,7 @@ export async function flushBatchBuffer(buf: BatchBuffer): Promise<void> {
     buf.swaps.length ? bulkInsertSwaps(buf.swaps) : Promise.resolve(),
     buf.poolDeltas.size ? bulkUpsertPool1minStats([...buf.poolDeltas.values()]) : Promise.resolve(),
     buf.tokenDeltas.size ? bulkUpsertToken1minStats([...buf.tokenDeltas.values()]) : Promise.resolve(),
+    buf.bnbPrices.length ? bulkInsertBnbPrice(buf.bnbPrices) : Promise.resolve(),
   ]);
 }
 
@@ -309,6 +318,62 @@ export async function getAllBinanceBscTokens(): Promise<BinanceBscToken[]> {
      FROM binance_bsc_tokens`
   );
   return res.rows;
+}
+
+// ============================================================================
+// BNB price history (from PancakeV2 WBNB/USDT pool swaps)
+// ============================================================================
+
+export interface BnbPriceRecord {
+  timestamp: number;
+  priceUsd: number;
+  blockNumber: number;
+  txHash: string;
+  logIndex: number;
+}
+
+export async function insertBnbPrice(rec: BnbPriceRecord): Promise<void> {
+  await getPool().query(
+    `INSERT INTO bnb_price_history (timestamp, price_usd, block_number, tx_hash, log_index)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (tx_hash, log_index) DO NOTHING`,
+    [rec.timestamp, rec.priceUsd, rec.blockNumber, rec.txHash, rec.logIndex]
+  );
+}
+
+export async function bulkInsertBnbPrice(recs: BnbPriceRecord[]): Promise<void> {
+  if (recs.length === 0) return;
+  const CHUNK = 1000;
+  for (let i = 0; i < recs.length; i += CHUNK) {
+    const slice = recs.slice(i, i + CHUNK);
+    const params: unknown[] = [];
+    const placeholders: string[] = [];
+    for (const r of slice) {
+      const base = params.length;
+      placeholders.push(`($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5})`);
+      params.push(r.timestamp, r.priceUsd, r.blockNumber, r.txHash, r.logIndex);
+    }
+    await getPool().query(
+      `INSERT INTO bnb_price_history (timestamp, price_usd, block_number, tx_hash, log_index)
+       VALUES ${placeholders.join(",")}
+       ON CONFLICT (tx_hash, log_index) DO NOTHING`,
+      params
+    );
+  }
+}
+
+/** 给定 timestamp，返回最近的 BNB/USD 价格（前后 1h 内最近一条；找不到返回 null）。 */
+export async function getBnbPriceAt(ts: number): Promise<number | null> {
+  const ONE_HOUR_MS = 60 * 60 * 1000;
+  const res = await getPool().query<{ price_usd: string }>(
+    `SELECT price_usd::text
+     FROM bnb_price_history
+     WHERE timestamp BETWEEN $1 AND $2
+     ORDER BY ABS(timestamp - $3) ASC
+     LIMIT 1`,
+    [ts - ONE_HOUR_MS, ts + ONE_HOUR_MS, ts]
+  );
+  return res.rows[0] ? Number(res.rows[0].price_usd) : null;
 }
 
 // ============================================================================
