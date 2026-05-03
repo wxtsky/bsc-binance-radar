@@ -25,6 +25,7 @@ import { createPublicClient, http, parseAbiItem, type Log } from "viem";
 import { bsc } from "viem/chains";
 import { getPool, initSchema, closeDatabase } from "../src/db/index.js";
 import { CONTRACTS } from "../src/config/contracts.js";
+import { CHAIN_STATIC } from "../src/config/chains.js";
 import { initPriceService, prewarmMetadataCache } from "../src/core/price-service.js";
 import { startTokenTracker, stopTokenTracker } from "../src/token-tracker/tracker.js";
 import {
@@ -37,6 +38,9 @@ import {
   prefetchV4PoolInfo,
 } from "../src/core/swap-listener.js";
 import {
+  bulkUpsertPools,
+  bulkUpsertV4Pools,
+  getAllBinanceBscTokens,
   newBatchBuffer,
   flushBatchBuffer,
   flushBatchBufferSwapsOnly,
@@ -78,6 +82,22 @@ const USE_STAGING = process.env.BF_STAGING !== "0";
 const FLUSH_WORKERS = Number(process.env.BF_FLUSH_WORKERS) || 4;
 // 内部 channel 队列上限（防 OOM；每个 buffer ~30k swap × ~150 bytes ≈ 5MB，16 个 = 80MB）
 const QUEUE_MAX = Number(process.env.BF_QUEUE_MAX) || 16;
+
+// V3 / PCS V3 PoolCreated（启动时 discover 用，拿到 token0/token1/fee 直接判断白名单）
+const V3_POOL_CREATED = parseAbiItem(
+  "event PoolCreated(address indexed token0, address indexed token1, uint24 indexed fee, int24 tickSpacing, address pool)"
+);
+
+// V4 PoolManager Initialize（V4 的「PoolCreated」）
+// 顺序：id, currency0, currency1, fee, tickSpacing, hooks, sqrtPriceX96, tick
+const V4_INITIALIZE = parseAbiItem(
+  "event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)"
+);
+
+// PCS V4 CL Initialize：顺序不同（hooks/fee/parameters）
+const PCS_V4_CL_INITIALIZE = parseAbiItem(
+  "event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, address hooks, uint24 fee, bytes32 parameters, uint160 sqrtPriceX96, int24 tick)"
+);
 
 const V3_SWAP = parseAbiItem(
   "event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)"
@@ -123,6 +143,159 @@ interface BatchTiming {
 }
 
 /**
+ * 启动时一次性 discover：拉 V3/PCS V3 Factory 的 **全历史** PoolCreated 事件
+ * （从 V3 BSC deploy block 扫到 latest），filter 至少含一个白名单 token 的池子，
+ * 得到精确的 pool address whitelist。
+ *
+ * ⚠️ 必须扫全历史不能只扫 90d —— 否则漏掉「90d 之前创建、但 90d 内有 swap 的老池子」。
+ *
+ * 之后 backfill 主循环 V3/PCS V3 swap getLogs 只查这些 pool address，
+ * 节点直接过滤 → 数据量 1/30，fetch 时长从 24s → 2-4s。
+ *
+ * 同时 PoolCreated event 自带 token0/token1/fee，可以直接 upsert pools 表，
+ * 后续 backfill prefetch 几乎全 cache hit（multicall 几乎不跑）。
+ *
+ * 启动开销：~71M blocks / 200K blocks/call = 355 calls × ~1.5s = 5-9 分钟。
+ * 节省：backfill ETA 30h → 5-7h，净赚 24h。
+ */
+const V3_BSC_DEPLOY_BLOCK = 25_000_000n; // 保守起点（V3 实际 deploy ~26.9M）
+
+async function discoverWhitelistedPools(
+  toBlock: bigint,
+  whitelistedTokens: Set<string>
+): Promise<{ v3: `0x${string}`[]; pcsV3: `0x${string}`[] }> {
+  const fromBlock = V3_BSC_DEPLOY_BLOCK;
+  const uniFactory = CONTRACTS.bsc.uniswapV3Factory as `0x${string}`;
+  const pcsFactory = CONTRACTS.bsc.pancakeswapV3Factory as `0x${string}`;
+  const totalBlocks = toBlock - fromBlock;
+  console.log(`[Discover] 全历史扫 V3/PCS V3 PoolCreated (${fromBlock} → ${toBlock}, ${totalBlocks} blocks)...`);
+  const t0 = Date.now();
+
+  // 200k blocks/call，节点应该能扛单次返回（PoolCreated 事件相对稀疏）
+  const STEP = 200000n;
+  const v3: `0x${string}`[] = [];
+  const pcsV3: `0x${string}`[] = [];
+  const allUpserts: Array<{ address: string; chain: "bsc"; dex: "uniswap-v3" | "pancakeswap-v3"; token0: string; token1: string; feeTier: number }> = [];
+
+  let scanned = 0n;
+  for (let from = fromBlock; from < toBlock; from += STEP) {
+    const to = from + STEP - 1n > toBlock ? toBlock : from + STEP - 1n;
+    const [uniLogs, pcsLogs] = await Promise.all([
+      httpClient.getLogs({ address: uniFactory, fromBlock: from, toBlock: to, event: V3_POOL_CREATED }),
+      httpClient.getLogs({ address: pcsFactory, fromBlock: from, toBlock: to, event: V3_POOL_CREATED }),
+    ]);
+    scanned += to - from + 1n;
+    if ((from - fromBlock) % (STEP * 20n) === 0n) {
+      const pct = Number((scanned * 100n) / totalBlocks);
+      const elapsedS = ((Date.now() - t0) / 1000).toFixed(0);
+      console.log(`[Discover] ${pct}% block ${to} | v3=${v3.length} pcsV3=${pcsV3.length} | ${elapsedS}s`);
+    }
+
+    for (const log of uniLogs) {
+      const a = log.args as { token0?: string; token1?: string; fee?: number; pool?: string };
+      if (!a.token0 || !a.token1 || !a.pool || a.fee === undefined) continue;
+      const t0l = a.token0.toLowerCase();
+      const t1l = a.token1.toLowerCase();
+      if (whitelistedTokens.has(t0l) || whitelistedTokens.has(t1l)) {
+        v3.push(a.pool as `0x${string}`);
+        allUpserts.push({ address: a.pool.toLowerCase(), chain: "bsc", dex: "uniswap-v3", token0: t0l, token1: t1l, feeTier: Number(a.fee) });
+      }
+    }
+    for (const log of pcsLogs) {
+      const a = log.args as { token0?: string; token1?: string; fee?: number; pool?: string };
+      if (!a.token0 || !a.token1 || !a.pool || a.fee === undefined) continue;
+      const t0l = a.token0.toLowerCase();
+      const t1l = a.token1.toLowerCase();
+      if (whitelistedTokens.has(t0l) || whitelistedTokens.has(t1l)) {
+        pcsV3.push(a.pool as `0x${string}`);
+        allUpserts.push({ address: a.pool.toLowerCase(), chain: "bsc", dex: "pancakeswap-v3", token0: t0l, token1: t1l, feeTier: Number(a.fee) });
+      }
+    }
+  }
+
+  // 一次性 upsert pools 表 → backfill 主循环 prefetch 全 cache hit
+  if (allUpserts.length > 0) {
+    await bulkUpsertPools(allUpserts);
+  }
+
+  console.log(`[Discover] V3 完成 ${((Date.now() - t0) / 1000).toFixed(0)}s — V3=${v3.length} 池, PCS V3=${pcsV3.length} 池, 已 upsert pools 表`);
+  return { v3, pcsV3 };
+}
+
+/**
+ * V4 / PCS V4 CL discovery：从 PoolManager Initialize 事件拿所有 poolId + token0/token1/fee/hooks，
+ * upsert v4_pools 表 → backfill 主循环 prefetch 全 cache hit（不走 multicall）。
+ *
+ * V4 BSC deploy ~2025-01（block ~46.5M），PCS V4 CL deploy ~2024 中。保险起点 45M。
+ * 范围 ~51M blocks，启动开销 ~5-7 分钟。
+ */
+const V4_BSC_DEPLOY_BLOCK = 45_000_000n;
+
+async function discoverV4Pools(
+  toBlock: bigint,
+  whitelistedTokens: Set<string>
+): Promise<void> {
+  const fromBlock = V4_BSC_DEPLOY_BLOCK;
+  const v4PoolManager = CONTRACTS.bsc.uniswapV4PoolManager as `0x${string}`;
+  const pcsV4ClPoolManager = CONTRACTS.bsc.pancakeswapV4ClPoolManager as `0x${string}`;
+  const totalBlocks = toBlock - fromBlock;
+  console.log(`[Discover V4] 扫 V4/PCS V4 CL Initialize (${fromBlock} → ${toBlock}, ${totalBlocks} blocks)...`);
+  const t0 = Date.now();
+
+  const STEP = 200000n;
+  const v4Upserts: Array<{ poolId: string; chain: "bsc"; info: { currency0: string; currency1: string; fee: number; tickSpacing: number; hooks: string } }> = [];
+  const pcsV4Upserts: Array<{ poolId: string; chain: "bsc"; info: { currency0: string; currency1: string; fee: number; tickSpacing: number; hooks: string } }> = [];
+
+  let scanned = 0n;
+  for (let from = fromBlock; from < toBlock; from += STEP) {
+    const to = from + STEP - 1n > toBlock ? toBlock : from + STEP - 1n;
+    const [v4Logs, pcsLogs] = await Promise.all([
+      httpClient.getLogs({ address: v4PoolManager, fromBlock: from, toBlock: to, event: V4_INITIALIZE }).catch(() => []),
+      httpClient.getLogs({ address: pcsV4ClPoolManager, fromBlock: from, toBlock: to, event: PCS_V4_CL_INITIALIZE }).catch(() => []),
+    ]);
+    scanned += to - from + 1n;
+
+    for (const log of v4Logs) {
+      const a = log.args as { id?: string; currency0?: string; currency1?: string; fee?: number; tickSpacing?: number; hooks?: string };
+      if (!a.id || !a.currency0 || !a.currency1) continue;
+      const c0 = a.currency0.toLowerCase();
+      const c1 = a.currency1.toLowerCase();
+      if (whitelistedTokens.has(c0) || whitelistedTokens.has(c1)) {
+        v4Upserts.push({
+          poolId: a.id,
+          chain: "bsc",
+          info: { currency0: c0, currency1: c1, fee: Number(a.fee ?? 0), tickSpacing: Number(a.tickSpacing ?? 0), hooks: (a.hooks ?? "0x0000000000000000000000000000000000000000").toLowerCase() },
+        });
+      }
+    }
+    for (const log of pcsLogs) {
+      const a = log.args as { id?: string; currency0?: string; currency1?: string; fee?: number; hooks?: string };
+      if (!a.id || !a.currency0 || !a.currency1) continue;
+      const c0 = a.currency0.toLowerCase();
+      const c1 = a.currency1.toLowerCase();
+      if (whitelistedTokens.has(c0) || whitelistedTokens.has(c1)) {
+        pcsV4Upserts.push({
+          poolId: `pcsv4cl:${a.id}`,
+          chain: "bsc",
+          info: { currency0: c0, currency1: c1, fee: Number(a.fee ?? 0), tickSpacing: 0, hooks: (a.hooks ?? "0x0000000000000000000000000000000000000000").toLowerCase() },
+        });
+      }
+    }
+
+    if ((from - fromBlock) % (STEP * 20n) === 0n) {
+      const pct = Number((scanned * 100n) / totalBlocks);
+      const elapsedS = ((Date.now() - t0) / 1000).toFixed(0);
+      console.log(`[Discover V4] ${pct}% block ${to} | v4=${v4Upserts.length} pcsV4=${pcsV4Upserts.length} | ${elapsedS}s`);
+    }
+  }
+
+  if (v4Upserts.length > 0) await bulkUpsertV4Pools(v4Upserts);
+  if (pcsV4Upserts.length > 0) await bulkUpsertV4Pools(pcsV4Upserts);
+
+  console.log(`[Discover V4] 完成 ${((Date.now() - t0) / 1000).toFixed(0)}s — V4=${v4Upserts.length} 池, PCS V4 CL=${pcsV4Upserts.length} 池`);
+}
+
+/**
  * Fetch + process（不 flush）。返回 BatchBuffer 给独立 flush worker 处理。
  * 拆 fetch / flush 解耦：fetcher 持续跑节点，flush 后台串行写 PG，互不阻塞。
  */
@@ -131,6 +304,8 @@ async function fetchAndProcessBatch(
   v4PoolManager: `0x${string}`,
   pcsV4ClPoolManager: `0x${string}`,
   bnbPricePool: `0x${string}`,
+  v3PoolList: `0x${string}`[],
+  pcsV3PoolList: `0x${string}`[],
   timing: BatchTiming
 ): Promise<{ buffer: BatchBuffer; logs: number; processed: number; errors: number }> {
   const { from, to } = job;
@@ -145,11 +320,13 @@ async function fetchAndProcessBatch(
   let bnbV2: Log[] = [];
   try {
     // getBlock + 5 个 getLogs 全部并发 in-flight（不再分两步）→ 节点真并行处理。
+    // V3/PCS V3 加 address: [...whitelistedPools] 让节点直接过滤，
+    // 数据量从全链 ~30k logs → 仅白名单池子 ~1k logs，fetch 时长腰斩。
     const [fb, tb, l1, l2, l3, l4, l5] = await Promise.all([
       httpClient.getBlock({ blockNumber: from }),
       httpClient.getBlock({ blockNumber: to }),
-      httpClient.getLogs({ fromBlock: from, toBlock: to, event: V3_SWAP }) as unknown as Promise<Log[]>,
-      httpClient.getLogs({ fromBlock: from, toBlock: to, event: PANCAKE_V3_SWAP }) as unknown as Promise<Log[]>,
+      httpClient.getLogs({ address: v3PoolList, fromBlock: from, toBlock: to, event: V3_SWAP }) as unknown as Promise<Log[]>,
+      httpClient.getLogs({ address: pcsV3PoolList, fromBlock: from, toBlock: to, event: PANCAKE_V3_SWAP }) as unknown as Promise<Log[]>,
       httpClient.getLogs({
         address: v4PoolManager,
         fromBlock: from,
@@ -328,6 +505,29 @@ async function main() {
     console.log(`[Backfill][${SHARD_LABEL}] staging mode ON: fetcher 写 swaps_staging（无 index），跑完 migrate 到 swaps`);
   }
 
+  // === Pool whitelist discovery（启动时一次性扫 V3/PCS V3 全历史 PoolCreated）===
+  // 让 V3/PCS V3 swap getLogs 带 address filter，节点直接过滤掉非白名单池子的 swap。
+  // BF_SKIP_DISCOVERY=1 跳过（仅 V4 单跑或调试用）
+  let v3PoolList: `0x${string}`[] = [];
+  let pcsV3PoolList: `0x${string}`[] = [];
+  if (process.env.BF_SKIP_DISCOVERY !== "1") {
+    const tokens = await getAllBinanceBscTokens();
+    const whitelistedTokens = new Set<string>();
+    for (const t of tokens) whitelistedTokens.add(t.contractAddress.toLowerCase());
+    // 加 base tokens（USDT/USDC/USD1/WBNB），让 base/base 池子也算白名单
+    for (const bt of CHAIN_STATIC.bsc.baseTokens) whitelistedTokens.add(bt);
+    console.log(`[Backfill][${SHARD_LABEL}] 白名单 token: ${whitelistedTokens.size}`);
+
+    const discovered = await discoverWhitelistedPools(end, whitelistedTokens);
+    v3PoolList = discovered.v3;
+    pcsV3PoolList = discovered.pcsV3;
+
+    // V4 / PCS V4 CL discovery（pre-fill v4_pools 表，让主循环 prefetch 全 cache hit）
+    await discoverV4Pools(end, whitelistedTokens);
+  } else {
+    console.log(`[Backfill][${SHARD_LABEL}] BF_SKIP_DISCOVERY=1, V3/PCS V3 走全链扫描 + V4 走链上 multicall（慢）`);
+  }
+
   // ============== 拆 fetch 和 flush 两个 worker pool ==============
   const fetchQueue = [...jobs];
   const flushQueue: Array<{ buffer: BatchBuffer; jobIndex: number }> = [];
@@ -350,7 +550,7 @@ async function main() {
         await new Promise((r) => setTimeout(r, 50));
       }
       try {
-        const r = await fetchAndProcessBatch(job, v4PoolManager, pcsV4ClPoolManager, bnbPricePool, timing);
+        const r = await fetchAndProcessBatch(job, v4PoolManager, pcsV4ClPoolManager, bnbPricePool, v3PoolList, pcsV3PoolList, timing);
         totalLogs += r.logs;
         totalProcessed += r.processed;
         totalErrors += r.errors;
