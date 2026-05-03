@@ -32,6 +32,9 @@ import {
   processV4SwapLog,
   processPcsV4ClSwapLog,
   processV2BnbPriceSwap,
+  prefetchPcsV4ClPoolInfo,
+  prefetchV3PoolInfo,
+  prefetchV4PoolInfo,
 } from "../src/core/swap-listener.js";
 import { newBatchBuffer, flushBatchBuffer } from "../src/db/queries.js";
 
@@ -132,6 +135,30 @@ async function processOneBatch(
 
   const logCount = v3.length + pancake.length + v4.length + pcsV4Cl.length + bnbV2.length;
   const buffer = newBatchBuffer();
+
+  // Prefetch pool info using viem multicall — 把 batch 内所有 unique pool 的元数据
+  // 一次性 batch RPC 拿回；不然每个 cache miss 都触发独立 readContract，很慢。
+  // 90d 前的 V3/V4/PCS V4 CL 池子大量都是新的（30d cache 不命中）。
+  await Promise.all([
+    prefetchV3PoolInfo(
+      v3.map((l) => l.address),
+      "bsc",
+      "uniswap-v3"
+    ),
+    prefetchV3PoolInfo(
+      pancake.map((l) => l.address),
+      "bsc",
+      "pancakeswap-v3"
+    ),
+    prefetchV4PoolInfo(
+      v4.map((l) => l.topics[1]).filter((id): id is `0x${string}` => typeof id === "string"),
+      "bsc"
+    ),
+    prefetchPcsV4ClPoolInfo(
+      pcsV4Cl.map((l) => l.topics[1]).filter((id): id is `0x${string}` => typeof id === "string"),
+      "bsc"
+    ),
+  ]);
 
   const tsForLog = (log: Log): number => {
     const blockNum = Number(log.blockNumber ?? from);

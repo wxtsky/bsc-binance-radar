@@ -204,6 +204,159 @@ async function getPoolInfo(
   }
 }
 
+/** 批量 prefetch V3 / Pancake-V3 pool info（用 viem multicall 一次拿一批 pool 的 token0/token1/fee）
+ *  跳过 verifyPoolFactory（90d 历史里 fake pool 概率极低）。
+ */
+export async function prefetchV3PoolInfo(
+  poolAddresses: string[],
+  chain: ChainId,
+  dex: "uniswap-v3" | "pancakeswap-v3"
+): Promise<void> {
+  if (poolAddresses.length === 0) return;
+  const unique = [...new Set(poolAddresses.map((a) => a.toLowerCase()))];
+  const newAddrs = unique.filter((addr) => {
+    const k = `${chain}:${addr}`;
+    return !poolInfoCache.has(k) && !invalidPoolCache.has(k);
+  });
+  if (newAddrs.length === 0) return;
+
+  // DB 批量查
+  const dbPools = await Promise.all(newAddrs.map((addr) => getPoolRecord(addr, chain).catch(() => null)));
+  const stillMissing: string[] = [];
+  for (let i = 0; i < newAddrs.length; i++) {
+    const dbPool = dbPools[i];
+    const addr = newAddrs[i];
+    if (dbPool) {
+      poolInfoCache.set(`${chain}:${addr}`, {
+        token0: dbPool.token0,
+        token1: dbPool.token1,
+        feeTier: dbPool.feeTier,
+      });
+    } else {
+      stillMissing.push(addr);
+    }
+  }
+  if (stillMissing.length === 0) return;
+
+  const abi = dex === "pancakeswap-v3" ? PANCAKESWAP_V3_POOL_ABI : UNISWAP_V3_POOL_ABI;
+  const client = getClient(chain);
+  const contracts = stillMissing.flatMap((addr) => [
+    { address: addr as `0x${string}`, abi, functionName: "token0" as const },
+    { address: addr as `0x${string}`, abi, functionName: "token1" as const },
+    { address: addr as `0x${string}`, abi, functionName: "fee" as const },
+  ]);
+
+  let results: { status: string; result?: unknown }[];
+  try {
+    results = (await client.multicall({ contracts: contracts as unknown as never })) as {
+      status: string;
+      result?: unknown;
+    }[];
+  } catch (err) {
+    console.warn(`[Radar] prefetchV3PoolInfo multicall failed (n=${stillMissing.length}): ${(err as Error).message}`);
+    return;
+  }
+
+  const upserts: Promise<void>[] = [];
+  for (let i = 0; i < stillMissing.length; i++) {
+    const addr = stillMissing[i];
+    const r0 = results[i * 3];
+    const r1 = results[i * 3 + 1];
+    const r2 = results[i * 3 + 2];
+    if (
+      !r0 || !r1 || !r2 ||
+      r0.status !== "success" || r1.status !== "success" || r2.status !== "success"
+    ) {
+      invalidPoolCache.add(`${chain}:${addr}`);
+      continue;
+    }
+    const info = {
+      token0: r0.result as string,
+      token1: r1.result as string,
+      feeTier: Number(r2.result),
+    };
+    poolInfoCache.set(`${chain}:${addr}`, info);
+    upserts.push(
+      upsertPool({ address: addr, chain, dex, token0: info.token0, token1: info.token1, feeTier: info.feeTier })
+    );
+  }
+  await Promise.all(upserts);
+}
+
+/** 批量 prefetch UniV4 pool info（同 PancakeV4 CL，但用 UniV4 PositionManager） */
+export async function prefetchV4PoolInfo(
+  poolIds: string[],
+  chain: ChainId
+): Promise<void> {
+  if (poolIds.length === 0) return;
+  const unique = [...new Set(poolIds)];
+  const newIds = unique.filter((id) => {
+    const k = `${chain}:${id}`;
+    return !v4PoolInfoCache.has(k) && !invalidV4PoolCache.has(k);
+  });
+  if (newIds.length === 0) return;
+
+  const dbPools = await Promise.all(newIds.map((id) => getV4Pool(id, chain).catch(() => null)));
+  const stillMissing: string[] = [];
+  for (let i = 0; i < newIds.length; i++) {
+    const dbPool = dbPools[i];
+    const id = newIds[i];
+    if (dbPool) {
+      v4PoolInfoCache.set(`${chain}:${id}`, dbPool);
+    } else {
+      stillMissing.push(id);
+    }
+  }
+  if (stillMissing.length === 0) return;
+
+  const positionManager = CONTRACTS[chain].uniswapV4PositionManager as `0x${string}`;
+  const client = getClient(chain);
+  const contracts = stillMissing.map((id) => ({
+    address: positionManager,
+    abi: UNISWAP_V4_POSITION_MANAGER_ABI,
+    functionName: "poolKeys" as const,
+    args: [slice(id as `0x${string}`, 0, 25)] as const,
+  }));
+
+  let results: { status: string; result?: unknown }[];
+  try {
+    results = (await client.multicall({ contracts: contracts as unknown as never })) as {
+      status: string;
+      result?: unknown;
+    }[];
+  } catch (err) {
+    console.warn(`[Radar] prefetchV4PoolInfo multicall failed (n=${stillMissing.length}): ${(err as Error).message}`);
+    return;
+  }
+
+  const ZERO = "0x0000000000000000000000000000000000000000";
+  const upserts: Promise<void>[] = [];
+  for (let i = 0; i < stillMissing.length; i++) {
+    const id = stillMissing[i];
+    const r = results[i];
+    if (!r || r.status !== "success") {
+      invalidV4PoolCache.add(`${chain}:${id}`);
+      continue;
+    }
+    const tup = r.result as [string, string, number, number, string];
+    const [c0, c1, fee, tickSpacing, hooks] = tup;
+    if ((c0 || ZERO).toLowerCase() === ZERO && (c1 || ZERO).toLowerCase() === ZERO) {
+      invalidV4PoolCache.add(`${chain}:${id}`);
+      continue;
+    }
+    const info: V4PoolTokenInfo = {
+      currency0: c0,
+      currency1: c1,
+      fee: Number(fee),
+      tickSpacing: Number(tickSpacing),
+      hooks,
+    };
+    v4PoolInfoCache.set(`${chain}:${id}`, info);
+    upserts.push(upsertV4Pool(id, chain, info));
+  }
+  await Promise.all(upserts);
+}
+
 function parseint256(hex: string): bigint {
   const value = BigInt(`0x${hex}`);
   const MAX_INT256 = 2n ** 255n;
@@ -588,6 +741,89 @@ async function getPcsV4ClPoolInfo(
     invalidPcsV4PoolCache.add(cacheKey);
     return null;
   }
+}
+
+/** 批量 prefetch PancakeV4 CL pool info（用 viem multicall 一次性 fetch 多个 poolKeys）
+ *  backfill 时 cache miss 多，此函数先把一批 logs 的 poolIds 一次 multicall 写入 cache + DB，
+ *  之后 processPcsV4ClSwapLog 全 cache hit 极快。
+ */
+export async function prefetchPcsV4ClPoolInfo(
+  poolIds: string[],
+  chain: ChainId
+): Promise<void> {
+  if (poolIds.length === 0) return;
+  const unique = [...new Set(poolIds)];
+  const newIds = unique.filter((id) => {
+    const k = `pcsv4cl:${chain}:${id}`;
+    return !pcsV4PoolInfoCache.has(k) && !invalidPcsV4PoolCache.has(k);
+  });
+  if (newIds.length === 0) return;
+
+  // 先 batch DB lookup（之前 backfill 跑过的池子已落 v4_pools）
+  const dbPools = await Promise.all(
+    newIds.map((id) => getV4Pool(`pcsv4cl:${id}`, chain).catch(() => null))
+  );
+  const stillMissing: string[] = [];
+  for (let i = 0; i < newIds.length; i++) {
+    const dbPool = dbPools[i];
+    const id = newIds[i];
+    if (dbPool) {
+      pcsV4PoolInfoCache.set(`pcsv4cl:${chain}:${id}`, dbPool);
+    } else {
+      stillMissing.push(id);
+    }
+  }
+  if (stillMissing.length === 0) return;
+
+  // 链上 multicall 拿剩下的 poolKeys
+  const positionManager = CONTRACTS[chain].pancakeswapV4ClPositionManager as `0x${string}`;
+  const client = getClient(chain);
+  const contracts = stillMissing.map((id) => ({
+    address: positionManager,
+    abi: PANCAKE_V4_CL_POSITION_MANAGER_ABI,
+    functionName: "poolKeys" as const,
+    args: [slice(id as `0x${string}`, 0, 25)] as const,
+  }));
+
+  // viem multicall 自动按 batch_size 拆分，一次 RPC 解决（typed as MulticallContracts ABI 固定）
+  let results: { status: string; result?: unknown }[];
+  try {
+    results = (await client.multicall({ contracts: contracts as unknown as never })) as {
+      status: string;
+      result?: unknown;
+    }[];
+  } catch (err) {
+    console.warn(`[Radar] prefetchPcsV4ClPoolInfo multicall failed (n=${stillMissing.length}): ${(err as Error).message}`);
+    return;
+  }
+
+  const ZERO = "0x0000000000000000000000000000000000000000";
+  const upserts: Promise<void>[] = [];
+  for (let i = 0; i < stillMissing.length; i++) {
+    const id = stillMissing[i];
+    const cacheKey = `pcsv4cl:${chain}:${id}`;
+    const r = results[i];
+    if (!r || r.status !== "success") {
+      invalidPcsV4PoolCache.add(cacheKey);
+      continue;
+    }
+    const tup = r.result as [string, string, string, string, number, string];
+    const [c0, c1, hooks, _pm, fee, _params] = tup;
+    if ((c0 || ZERO).toLowerCase() === ZERO && (c1 || ZERO).toLowerCase() === ZERO) {
+      invalidPcsV4PoolCache.add(cacheKey);
+      continue;
+    }
+    const info: V4PoolTokenInfo = {
+      currency0: c0,
+      currency1: c1,
+      fee: Number(fee),
+      tickSpacing: 0,
+      hooks,
+    };
+    pcsV4PoolInfoCache.set(cacheKey, info);
+    upserts.push(upsertV4Pool(`pcsv4cl:${id}`, chain, info));
+  }
+  await Promise.all(upserts);
 }
 
 /** PancakeV4 CL Swap log data: amount0(int128) | amount1(int128) | sqrtPriceX96(uint160)
