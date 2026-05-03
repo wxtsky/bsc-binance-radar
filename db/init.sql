@@ -26,8 +26,11 @@ CREATE TABLE IF NOT EXISTS v4_pools (
   PRIMARY KEY (pool_id, chain)
 );
 
+-- 启用 TimescaleDB 扩展（image: timescale/timescaledb:latest-pg17）
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+
 CREATE TABLE IF NOT EXISTS swaps (
-  id BIGSERIAL PRIMARY KEY,
+  id BIGSERIAL,
   pool_address TEXT NOT NULL,
   chain TEXT NOT NULL,
   dex TEXT NOT NULL,
@@ -37,19 +40,27 @@ CREATE TABLE IF NOT EXISTS swaps (
   fee_usd DOUBLE PRECISION NOT NULL,
   volume_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
   timestamp BIGINT NOT NULL,
-  block_number BIGINT NOT NULL
+  block_number BIGINT NOT NULL,
+  -- TimescaleDB hypertable 要求所有 unique constraint（含 PK）必须包含 partition key (timestamp)
+  PRIMARY KEY (id, "timestamp")
 );
 CREATE INDEX IF NOT EXISTS idx_swaps_pool_time ON swaps(pool_address, timestamp);
 CREATE INDEX IF NOT EXISTS idx_swaps_time ON swaps(timestamp);
--- 已删：idx_swaps_chain_dex_time / idx_swaps_time_chain_valid
--- 这两个索引共 3.3GB，每条 swap INSERT 都要更新它们，但 detector 只查
--- token_1min_stats / pool_1min_stats，rebuild 只用 idx_swaps_time。
--- 删了之后 backfill INSERT 提速 ~30%（详见 HANDOFF § 16.G）。
--- 唯一约束：(tx_hash, pool_address, amount0, amount1) 是 EVM swap 在没存 log_index 情况下
--- 实际可达的最稳定唯一标识。同一 tx 同一 pool 完全相同 amount 出现两次的概率几乎为 0。
--- 配合 INSERT ... ON CONFLICT DO NOTHING 实现 backfill 与 stream 双写下的去重。
+-- 已删：idx_swaps_chain_dex_time / idx_swaps_time_chain_valid（detector 不查 swaps）
+-- 唯一约束：(tx_hash, pool_address, amount0, amount1, timestamp) 用于 stream + backfill
+-- 双写下的 ON CONFLICT DO NOTHING 去重。timestamp 是同一 swap 固定值（block ts），
+-- 加进去不影响去重效果，只是满足 hypertable partition key 要求。
 CREATE UNIQUE INDEX IF NOT EXISTS uq_swaps_dedup
-  ON swaps(tx_hash, pool_address, amount0, amount1);
+  ON swaps(tx_hash, pool_address, amount0, amount1, "timestamp");
+
+-- 转 hypertable：每 7d 一个 chunk（606040*100ms = 7d in ms）。
+-- 已存在的 hypertable 调用 create_hypertable 会报错，用 if_not_exists 跳过。
+SELECT create_hypertable(
+  'swaps',
+  'timestamp',
+  chunk_time_interval => bigint '604800000',
+  if_not_exists => true
+);
 
 CREATE TABLE IF NOT EXISTS pool_1min_stats (
   pool_address TEXT NOT NULL,

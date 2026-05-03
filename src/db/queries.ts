@@ -127,7 +127,7 @@ async function bulkInsertSwaps(swaps: SwapRecord[]): Promise<void> {
          $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
          $7::float8[], $8::float8[], $9::bigint[], $10::bigint[]
        )
-       ON CONFLICT (tx_hash, pool_address, amount0, amount1) DO NOTHING`,
+       ON CONFLICT (tx_hash, pool_address, amount0, amount1, timestamp) DO NOTHING`,
       [poolAddrs, chains, dexes, txHashes, amount0s, amount1s, feeUsds, volumeUsds, timestamps, blockNumbers]
     );
   }
@@ -211,7 +211,7 @@ export async function insertSwap(swap: SwapRecord): Promise<void> {
   await getPool().query(
     `INSERT INTO swaps (pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-     ON CONFLICT (tx_hash, pool_address, amount0, amount1) DO NOTHING`,
+     ON CONFLICT (tx_hash, pool_address, amount0, amount1, timestamp) DO NOTHING`,
     [
       swap.poolAddress,
       swap.chain,
