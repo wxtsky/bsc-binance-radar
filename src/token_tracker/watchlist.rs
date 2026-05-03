@@ -1,10 +1,10 @@
 use crate::db::queries::select_all_binance_bsc_tokens;
+use alloy::primitives::Address;
 use anyhow::Result;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// 内存中的白名单：address(lowercase) → (symbol, decimals)
 #[derive(Debug, Clone)]
 pub struct WatchlistInfo {
     pub symbol: String,
@@ -12,7 +12,7 @@ pub struct WatchlistInfo {
 }
 
 pub struct Watchlist {
-    pub by_address: HashMap<String, WatchlistInfo>,
+    pub by_address: HashMap<Address, WatchlistInfo>,
 }
 
 static WATCHLIST: once_cell::sync::OnceCell<Arc<RwLock<Watchlist>>> = once_cell::sync::OnceCell::new();
@@ -29,7 +29,7 @@ pub async fn load_watchlist() -> Result<()> {
     let mut map = HashMap::with_capacity(tokens.len());
     for t in &tokens {
         map.insert(
-            t.contract_address.to_lowercase(),
+            t.contract_address,
             WatchlistInfo {
                 symbol: t.symbol.clone(),
                 decimals: t.decimals.try_into().unwrap_or(18),
@@ -51,16 +51,16 @@ pub fn get_watchlist() -> Arc<RwLock<Watchlist>> {
         .clone()
 }
 
-pub fn is_watched(address: &str) -> bool {
+pub fn is_watched(address: Address) -> bool {
     let watchlist = get_watchlist();
     let guard = watchlist.read();
-    guard.by_address.contains_key(&address.to_lowercase())
+    guard.by_address.contains_key(&address)
 }
 
-pub fn watchlist_addresses() -> HashSet<String> {
+pub fn watchlist_addresses() -> HashSet<Address> {
     let watchlist = get_watchlist();
     let guard = watchlist.read();
-    guard.by_address.keys().cloned().collect()
+    guard.by_address.keys().copied().collect()
 }
 
 pub fn watchlist_size() -> usize {

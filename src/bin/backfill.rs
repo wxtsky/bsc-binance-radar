@@ -96,78 +96,35 @@ struct PoolCache {
 }
 
 async fn load_pool_cache() -> Result<PoolCache> {
-    let pool = bsc_binance_radar::db::get_pool().get().await?;
-    let v3_rows = pool.query(
-        "SELECT address, token0, token1, fee_tier FROM pools WHERE chain='bsc' AND dex='uniswap-v3'",
-        &[],
+    let v3_raw = bsc_binance_radar::db::queries::load_v3_pool_cache(
+        bsc_binance_radar::types::CHAIN_BSC, DexType::UniswapV3
     ).await?;
-    let mut v3: HashMap<Address, PoolMeta> = HashMap::with_capacity(v3_rows.len());
-    for r in &v3_rows {
-        let addr_str: String = r.get(0);
-        if let Ok(addr) = addr_str.parse() {
-            v3.insert(addr, PoolMeta {
-                token0: r.get::<_, String>(1).to_lowercase(),
-                token1: r.get::<_, String>(2).to_lowercase(),
-                fee_tier: r.get::<_, i32>(3) as u32,
-            });
-        }
-    }
+    let pcs_v3_raw = bsc_binance_radar::db::queries::load_v3_pool_cache(
+        bsc_binance_radar::types::CHAIN_BSC, DexType::PancakeswapV3
+    ).await?;
+    let v4_raw = bsc_binance_radar::db::queries::load_v4_pool_cache(
+        bsc_binance_radar::types::CHAIN_BSC, DexType::UniswapV4
+    ).await?;
+    let pcs_v4_raw = bsc_binance_radar::db::queries::load_v4_pool_cache(
+        bsc_binance_radar::types::CHAIN_BSC, DexType::PancakeswapV4Cl
+    ).await?;
 
-    let pcs_rows = pool.query(
-        "SELECT address, token0, token1, fee_tier FROM pools WHERE chain='bsc' AND dex='pancakeswap-v3'",
-        &[],
-    ).await?;
-    let mut pcs_v3: HashMap<Address, PoolMeta> = HashMap::with_capacity(pcs_rows.len());
-    for r in &pcs_rows {
-        let addr_str: String = r.get(0);
-        if let Ok(addr) = addr_str.parse() {
-            pcs_v3.insert(addr, PoolMeta {
-                token0: r.get::<_, String>(1).to_lowercase(),
-                token1: r.get::<_, String>(2).to_lowercase(),
-                fee_tier: r.get::<_, i32>(3) as u32,
-            });
-        }
-    }
-
-    let v4_rows = pool.query(
-        "SELECT pool_id, currency0, currency1, fee FROM v4_pools WHERE chain='bsc' AND pool_id NOT LIKE 'pcsv4cl:%'",
-        &[],
-    ).await?;
-    let mut v4: HashMap<B256, PoolMeta> = HashMap::with_capacity(v4_rows.len());
-    for r in &v4_rows {
-        let id_str: String = r.get(0);
-        if let Ok(id) = id_str.parse() {
-            v4.insert(id, PoolMeta {
-                token0: r.get::<_, String>(1).to_lowercase(),
-                token1: r.get::<_, String>(2).to_lowercase(),
-                fee_tier: r.get::<_, i32>(3) as u32,
-            });
-        }
-    }
-
-    let pcs_v4_rows = pool.query(
-        "SELECT pool_id, currency0, currency1, fee FROM v4_pools WHERE chain='bsc' AND pool_id LIKE 'pcsv4cl:%'",
-        &[],
-    ).await?;
-    let mut pcs_v4_cl: HashMap<B256, PoolMeta> = HashMap::with_capacity(pcs_v4_rows.len());
-    for r in &pcs_v4_rows {
-        let id_str: String = r.get::<_, String>(0);
-        let id_bare = id_str.trim_start_matches("pcsv4cl:");
-        if let Ok(id) = id_bare.parse() {
-            pcs_v4_cl.insert(id, PoolMeta {
-                token0: r.get::<_, String>(1).to_lowercase(),
-                token1: r.get::<_, String>(2).to_lowercase(),
-                fee_tier: r.get::<_, i32>(3) as u32,
-            });
-        }
-    }
+    let v3: HashMap<Address, PoolMeta> = v3_raw.into_iter().map(|(addr, (t0, t1, fee))| {
+        (addr, PoolMeta { token0: t0, token1: t1, fee_tier: fee })
+    }).collect();
+    let pcs_v3: HashMap<Address, PoolMeta> = pcs_v3_raw.into_iter().map(|(addr, (t0, t1, fee))| {
+        (addr, PoolMeta { token0: t0, token1: t1, fee_tier: fee })
+    }).collect();
+    let v4: HashMap<B256, PoolMeta> = v4_raw.into_iter().map(|(id, (c0, c1, fee))| {
+        (id, PoolMeta { token0: c0, token1: c1, fee_tier: fee })
+    }).collect();
+    let pcs_v4_cl: HashMap<B256, PoolMeta> = pcs_v4_raw.into_iter().map(|(id, (c0, c1, fee))| {
+        (id, PoolMeta { token0: c0, token1: c1, fee_tier: fee })
+    }).collect();
 
     info!(
         "[PoolCache] preloaded V3={} PCS V3={} V4={} PCS V4 CL={}",
-        v3.len(),
-        pcs_v3.len(),
-        v4.len(),
-        pcs_v4_cl.len()
+        v3.len(), pcs_v3.len(), v4.len(), pcs_v4_cl.len()
     );
     Ok(PoolCache { v3, pcs_v3, v4, pcs_v4_cl })
 }
@@ -276,8 +233,7 @@ async fn fetch_one_batch(
             None => continue,
         };
         let ts = interpolate_log_ts(&log, from, to, from_ts_ms, to_ts_ms);
-        let pool_addr_str = format!("{:?}", pool_addr).to_lowercase();
-        match process_v3_swap(&log, "bsc", DexType::UniswapV3, meta, &pool_addr_str, ts, bnb_now) {
+        match process_v3_swap(&log, bsc_binance_radar::types::CHAIN_BSC, DexType::UniswapV3, meta, pool_addr, ts, bnb_now) {
             Ok(rec) => buffer.swaps.push(rec),
             Err(e) => warn!("V3 process fail: {}", e),
         }
@@ -291,8 +247,7 @@ async fn fetch_one_batch(
             None => continue,
         };
         let ts = interpolate_log_ts(&log, from, to, from_ts_ms, to_ts_ms);
-        let pool_addr_str = format!("{:?}", pool_addr).to_lowercase();
-        match process_v3_swap(&log, "bsc", DexType::PancakeswapV3, meta, &pool_addr_str, ts, bnb_now) {
+        match process_v3_swap(&log, bsc_binance_radar::types::CHAIN_BSC, DexType::PancakeswapV3, meta, pool_addr, ts, bnb_now) {
             Ok(rec) => buffer.swaps.push(rec),
             Err(e) => warn!("PCS V3 process fail: {}", e),
         }
@@ -309,8 +264,7 @@ async fn fetch_one_batch(
             None => continue,
         };
         let ts = interpolate_log_ts(&log, from, to, from_ts_ms, to_ts_ms);
-        let pool_id_str = format!("{:?}", id);
-        match process_v4_swap(&log, "bsc", meta, &pool_id_str, ts, bnb_now) {
+        match process_v4_swap(&log, bsc_binance_radar::types::CHAIN_BSC, meta, id, ts, bnb_now) {
             Ok(rec) => buffer.swaps.push(rec),
             Err(e) => warn!("V4 process fail: {}", e),
         }
@@ -327,8 +281,7 @@ async fn fetch_one_batch(
             None => continue,
         };
         let ts = interpolate_log_ts(&log, from, to, from_ts_ms, to_ts_ms);
-        let pool_id_str = format!("pcsv4cl:{:?}", id);
-        match process_pcs_v4_cl_swap(&log, "bsc", meta, &pool_id_str, ts, bnb_now) {
+        match process_pcs_v4_cl_swap(&log, bsc_binance_radar::types::CHAIN_BSC, meta, id, ts, bnb_now) {
             Ok(rec) => buffer.swaps.push(rec),
             Err(e) => warn!("PCS V4 CL process fail: {}", e),
         }
