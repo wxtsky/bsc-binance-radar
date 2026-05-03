@@ -32,14 +32,13 @@ fi
 echo "Migrate staging WHERE timestamp < $CUTOFF" >> "$LOG"
 
 # 单事务：INSERT swaps + DELETE staging
+# 用 ON CONFLICT DO NOTHING 兜底 staging 内重复 + swaps 已存在去重，不用 DISTINCT ON 大 sort
 docker exec radar-pg psql -U radar -d radar -c "
 BEGIN;
 INSERT INTO swaps (pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number)
-SELECT DISTINCT ON (tx_hash, pool_address, amount0, amount1, timestamp)
-       pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number
+SELECT pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number
 FROM swaps_staging
 WHERE timestamp < $CUTOFF
-ORDER BY tx_hash, pool_address, amount0, amount1, timestamp, block_number
 ON CONFLICT (tx_hash, pool_address, amount0, amount1, timestamp) DO NOTHING;
 DELETE FROM swaps_staging WHERE timestamp < $CUTOFF;
 COMMIT;" >> "$LOG" 2>&1
