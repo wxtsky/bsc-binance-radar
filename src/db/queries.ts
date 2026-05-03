@@ -169,6 +169,19 @@ export async function flushBatchBuffer(buf: BatchBuffer): Promise<void> {
   ]);
 }
 
+/**
+ * 只 flush swaps + bnb_prices，跳过 pool_1min_stats / token_1min_stats。
+ * Backfill 专用：跑完后 rebuildBucketsFromSwaps 会从 swaps 重建 buckets，
+ * 中间累加 buckets 完全是浪费 —— 这两表占 flush 大头（multi-row UPSERT 触发
+ * ON CONFLICT DO UPDATE，多 worker 并发还互相 deadlock）。
+ */
+export async function flushBatchBufferSwapsOnly(buf: BatchBuffer): Promise<void> {
+  await Promise.all([
+    buf.swaps.length ? bulkInsertSwaps(buf.swaps) : Promise.resolve(),
+    buf.bnbPrices.length ? bulkInsertBnbPrice(buf.bnbPrices) : Promise.resolve(),
+  ]);
+}
+
 // ============================================================================
 // Swap / pool persistence
 // ============================================================================

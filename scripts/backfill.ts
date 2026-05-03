@@ -36,7 +36,7 @@ import {
   prefetchV3PoolInfo,
   prefetchV4PoolInfo,
 } from "../src/core/swap-listener.js";
-import { newBatchBuffer, flushBatchBuffer } from "../src/db/queries.js";
+import { newBatchBuffer, flushBatchBuffer, flushBatchBufferSwapsOnly } from "../src/db/queries.js";
 
 function parseDuration(s: string | undefined): number {
   if (!s) return 24;
@@ -237,9 +237,11 @@ async function processOneBatch(
 
   timing.processMs += Date.now() - processT0;
 
-  // 批量 flush 到 PG
+  // 批量 flush 到 PG —— 只写 swaps + bnb_prices。
+  // pool_1min_stats / token_1min_stats 跑完后 rebuildBucketsFromSwaps 重建覆盖，
+  // 中间累加 buckets 既浪费 IO 又是 8 worker deadlock 根源。
   const flushT0 = Date.now();
-  await flushBatchBuffer(buffer);
+  await flushBatchBufferSwapsOnly(buffer);
   timing.flushMs += Date.now() - flushT0;
 
   return { logs: logCount, processed, errors };
