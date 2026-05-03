@@ -47,7 +47,9 @@ function parseDuration(s: string | undefined): number {
 }
 
 const HOURS = parseDuration(process.argv[2]);
-const CONCURRENCY = Number(process.argv[3]) || 6;
+// 默认 8 worker（节点限 ~3-4 并发 / 单 IP，8 worker × 5 getLogs ≈ 节点甜点）。
+// 实测：16 worker 节点排队反而慢。
+const CONCURRENCY = Number(process.argv[3]) || Number(process.env.BF_CONCURRENCY) || 8;
 // 默认 1000 blocks/batch（30d 测过最稳）。BF_BATCH_SIZE 可覆盖。
 const BLOCKS_PER_BATCH = BigInt(Number(process.env.BF_BATCH_SIZE) || 1000);
 
@@ -71,13 +73,14 @@ const V2_SWAP = parseAbiItem(
 
 const httpClient = createPublicClient({
   chain: bsc,
-  // transport batch 小 size：合最多 2 个 RPC 到 1 个 HTTP request 减半 round trip。
-  // batchSize=2 控制 response 上限 ≤ 10MB（节点 30MB limit 内安全），
-  // 不会触发 "response too large"。
+  // 关闭 transport batch（不合并多个 RPC 到 1 个 HTTP）。
+  // 单 batch 内 5 个 getLogs 同时 in-flight 时，合并会让节点串行处理这 N 个 RPC，
+  // 其中 V3 / PCS V3 全链 getLogs 单次 12-16s（无 address filter），
+  // 跟轻量的 V4 / PCS V4 / BNB getLogs 合并 = 整体被慢的拖死。
+  // 不合并 → 节点能真并发处理，单 batch 时长 ≈ max(getLogs) 而不是 sum。
   transport: http(HTTP_URL, {
-    timeout: 30_000,
+    timeout: 60_000,
     retryCount: 2,
-    batch: { wait: 10, batchSize: 2 },
   }),
   batch: { multicall: true },
 });
@@ -88,34 +91,35 @@ interface BatchJob {
   index: number;
 }
 
+interface BatchTiming {
+  fetchMs: number;
+  prefetchMs: number;
+  processMs: number;
+  flushMs: number;
+}
+
 async function processOneBatch(
   job: BatchJob,
   v4PoolManager: `0x${string}`,
   pcsV4ClPoolManager: `0x${string}`,
-  bnbPricePool: `0x${string}`
+  bnbPricePool: `0x${string}`,
+  timing: BatchTiming
 ): Promise<{ logs: number; processed: number; errors: number }> {
   const { from, to } = job;
 
+  const fetchT0 = Date.now();
   let fromTs: number;
   let toTs: number;
-  try {
-    const [fb, tb] = await Promise.all([
-      httpClient.getBlock({ blockNumber: from }),
-      httpClient.getBlock({ blockNumber: to }),
-    ]);
-    fromTs = Number(fb.timestamp) * 1000;
-    toTs = Number(tb.timestamp) * 1000;
-  } catch (err) {
-    throw new Error(`getBlock ${from}/${to}: ${(err as Error).message}`);
-  }
-
   let v3: Log[] = [];
   let pancake: Log[] = [];
   let v4: Log[] = [];
   let pcsV4Cl: Log[] = [];
   let bnbV2: Log[] = [];
   try {
-    [v3, pancake, v4, pcsV4Cl, bnbV2] = await Promise.all([
+    // getBlock + 5 个 getLogs 全部并发 in-flight（不再分两步）→ 节点真并行处理。
+    const [fb, tb, l1, l2, l3, l4, l5] = await Promise.all([
+      httpClient.getBlock({ blockNumber: from }),
+      httpClient.getBlock({ blockNumber: to }),
       httpClient.getLogs({ fromBlock: from, toBlock: to, event: V3_SWAP }) as unknown as Promise<Log[]>,
       httpClient.getLogs({ fromBlock: from, toBlock: to, event: PANCAKE_V3_SWAP }) as unknown as Promise<Log[]>,
       httpClient.getLogs({
@@ -137,9 +141,17 @@ async function processOneBatch(
         event: V2_SWAP,
       }) as unknown as Promise<Log[]>,
     ]);
+    fromTs = Number(fb.timestamp) * 1000;
+    toTs = Number(tb.timestamp) * 1000;
+    v3 = l1;
+    pancake = l2;
+    v4 = l3;
+    pcsV4Cl = l4;
+    bnbV2 = l5;
   } catch (err) {
-    throw new Error(`getLogs ${from}-${to}: ${(err as Error).message}`);
+    throw new Error(`fetch ${from}-${to}: ${(err as Error).message}`);
   }
+  timing.fetchMs += Date.now() - fetchT0;
 
   const logCount = v3.length + pancake.length + v4.length + pcsV4Cl.length + bnbV2.length;
   const buffer = newBatchBuffer();
@@ -147,6 +159,7 @@ async function processOneBatch(
   // Prefetch pool info using viem multicall — 把 batch 内所有 unique pool 的元数据
   // 一次性 batch RPC 拿回；不然每个 cache miss 都触发独立 readContract，很慢。
   // 90d 前的 V3/V4/PCS V4 CL 池子大量都是新的（30d cache 不命中）。
+  const prefetchT0 = Date.now();
   await Promise.all([
     prefetchV3PoolInfo(
       v3.map((l) => l.address),
@@ -167,6 +180,7 @@ async function processOneBatch(
       "bsc"
     ),
   ]);
+  timing.prefetchMs += Date.now() - prefetchT0;
 
   const tsForLog = (log: Log): number => {
     const blockNum = Number(log.blockNumber ?? from);
@@ -178,6 +192,7 @@ async function processOneBatch(
   let processed = 0;
   let errors = 0;
 
+  const processT0 = Date.now();
   // process 每条 log（getPoolInfo/getV4PoolInfo cache 受益），写到内存 buffer
   for (const log of v3) {
     try {
@@ -220,8 +235,12 @@ async function processOneBatch(
     }
   }
 
+  timing.processMs += Date.now() - processT0;
+
   // 批量 flush 到 PG
+  const flushT0 = Date.now();
   await flushBatchBuffer(buffer);
+  timing.flushMs += Date.now() - flushT0;
 
   return { logs: logCount, processed, errors };
 }
@@ -278,13 +297,15 @@ async function main() {
   let totalProcessed = 0;
   let totalErrors = 0;
   let completedBatches = 0;
+  // 阶段累计时长（worker 维度，跨 worker 求和）。除以 worker 数得出每 worker 平均阶段时长。
+  const timing: BatchTiming = { fetchMs: 0, prefetchMs: 0, processMs: 0, flushMs: 0 };
 
   async function worker() {
     while (queue.length > 0) {
       const job = queue.shift();
       if (!job) break;
       try {
-        const r = await processOneBatch(job, v4PoolManager, pcsV4ClPoolManager, bnbPricePool);
+        const r = await processOneBatch(job, v4PoolManager, pcsV4ClPoolManager, bnbPricePool, timing);
         totalLogs += r.logs;
         totalProcessed += r.processed;
         totalErrors += r.errors;
@@ -297,8 +318,15 @@ async function main() {
         const pct = Math.round((completedBatches * 100) / jobs.length);
         const elapsedS = ((Date.now() - t0) / 1000).toFixed(0);
         const rate = (completedBatches / parseFloat(elapsedS)).toFixed(2);
+        // 每 batch 平均各阶段（毫秒），按 worker 维度归一（总时长/总 batch）。
+        const avgFetch = (timing.fetchMs / completedBatches).toFixed(0);
+        const avgPrefetch = (timing.prefetchMs / completedBatches).toFixed(0);
+        const avgProcess = (timing.processMs / completedBatches).toFixed(0);
+        const avgFlush = (timing.flushMs / completedBatches).toFixed(0);
+        const remainBatches = jobs.length - completedBatches;
+        const etaH = remainBatches / parseFloat(rate) / 3600;
         console.log(
-          `[Backfill] ${pct}% ${completedBatches}/${jobs.length} | logs=${totalLogs} ok=${totalProcessed} err=${totalErrors} | ${elapsedS}s ${rate}batch/s`
+          `[Backfill] ${pct}% ${completedBatches}/${jobs.length} | logs=${totalLogs} ok=${totalProcessed} err=${totalErrors} | ${elapsedS}s ${rate}batch/s ETA=${etaH.toFixed(1)}h | avg ms: fetch=${avgFetch} prefetch=${avgPrefetch} process=${avgProcess} flush=${avgFlush}`
         );
       }
     }
