@@ -1,9 +1,11 @@
 pub mod abis;
+pub mod anomaly;
 pub mod chain;
 pub mod clients;
 pub mod contracts;
 pub mod db;
 pub mod discovery;
+pub mod notifier;
 pub mod swap_processor;
 pub mod token_tracker;
 pub mod types;

@@ -4,7 +4,7 @@
 #
 # 体积目标：runtime image ~80MB（vs Bun 镜像 ~250MB）
 
-FROM rust:1.82-slim-bookworm AS builder
+FROM rust:1-slim-bookworm AS builder
 WORKDIR /app
 
 # 系统依赖（rustls 用 ring，不需要 libssl-dev；为 reqwest features 已切 rustls-tls）
