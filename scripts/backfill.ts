@@ -36,7 +36,15 @@ import {
   prefetchV3PoolInfo,
   prefetchV4PoolInfo,
 } from "../src/core/swap-listener.js";
-import { newBatchBuffer, flushBatchBuffer, flushBatchBufferSwapsOnly } from "../src/db/queries.js";
+import {
+  newBatchBuffer,
+  flushBatchBuffer,
+  flushBatchBufferSwapsOnly,
+  flushBatchBufferToStaging,
+  createStagingTable,
+  migrateStagingToSwaps,
+  type BatchBuffer,
+} from "../src/db/queries.js";
 
 function parseDuration(s: string | undefined): number {
   if (!s) return 24;
@@ -61,6 +69,15 @@ const FROM_BLOCK_OVERRIDE = process.env.BF_FROM_BLOCK ? BigInt(process.env.BF_FR
 const TO_BLOCK_OVERRIDE = process.env.BF_TO_BLOCK ? BigInt(process.env.BF_TO_BLOCK) : null;
 const SKIP_REBUILD = process.env.BF_SKIP_REBUILD === "1";
 const SHARD_LABEL = process.env.BF_SHARD_LABEL || "main";
+
+// Staging 模式：fetcher 写到无索引 staging 表，跑完 migrate 到 swaps。
+// 默认开启（解耦 fetch / flush，跨过 hypertable INSERT 慢的瓶颈）。
+// BF_STAGING=0 关闭走老的 hypertable 直写。
+const USE_STAGING = process.env.BF_STAGING !== "0";
+// flush worker 数量（独立于 fetch worker）。staging 写入很快，少量 worker 即可。
+const FLUSH_WORKERS = Number(process.env.BF_FLUSH_WORKERS) || 4;
+// 内部 channel 队列上限（防 OOM；每个 buffer ~30k swap × ~150 bytes ≈ 5MB，16 个 = 80MB）
+const QUEUE_MAX = Number(process.env.BF_QUEUE_MAX) || 16;
 
 const V3_SWAP = parseAbiItem(
   "event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)"
@@ -105,13 +122,17 @@ interface BatchTiming {
   flushMs: number;
 }
 
-async function processOneBatch(
+/**
+ * Fetch + process（不 flush）。返回 BatchBuffer 给独立 flush worker 处理。
+ * 拆 fetch / flush 解耦：fetcher 持续跑节点，flush 后台串行写 PG，互不阻塞。
+ */
+async function fetchAndProcessBatch(
   job: BatchJob,
   v4PoolManager: `0x${string}`,
   pcsV4ClPoolManager: `0x${string}`,
   bnbPricePool: `0x${string}`,
   timing: BatchTiming
-): Promise<{ logs: number; processed: number; errors: number }> {
+): Promise<{ buffer: BatchBuffer; logs: number; processed: number; errors: number }> {
   const { from, to } = job;
 
   const fetchT0 = Date.now();
@@ -244,14 +265,8 @@ async function processOneBatch(
 
   timing.processMs += Date.now() - processT0;
 
-  // 批量 flush 到 PG —— 只写 swaps + bnb_prices。
-  // pool_1min_stats / token_1min_stats 跑完后 rebuildBucketsFromSwaps 重建覆盖，
-  // 中间累加 buckets 既浪费 IO 又是 8 worker deadlock 根源。
-  const flushT0 = Date.now();
-  await flushBatchBufferSwapsOnly(buffer);
-  timing.flushMs += Date.now() - flushT0;
-
-  return { logs: logCount, processed, errors };
+  // 不在这里 flush（拆出独立 flush worker）
+  return { buffer, logs: logCount, processed, errors };
 }
 
 async function main() {
@@ -307,54 +322,108 @@ async function main() {
   const pcsV4ClPoolManager = CONTRACTS.bsc.pancakeswapV4ClPoolManager as `0x${string}`;
   const bnbPricePool = CONTRACTS.bsc.bnbPricePool as `0x${string}`;
 
-  // worker pool
-  const queue = [...jobs];
+  // 准备 staging 表（如果用 staging 模式）
+  if (USE_STAGING) {
+    await createStagingTable();
+    console.log(`[Backfill][${SHARD_LABEL}] staging mode ON: fetcher 写 swaps_staging（无 index），跑完 migrate 到 swaps`);
+  }
+
+  // ============== 拆 fetch 和 flush 两个 worker pool ==============
+  const fetchQueue = [...jobs];
+  const flushQueue: Array<{ buffer: BatchBuffer; jobIndex: number }> = [];
+  let fetchersDone = false;
   const t0 = Date.now();
   let totalLogs = 0;
   let totalProcessed = 0;
   let totalErrors = 0;
-  let completedBatches = 0;
-  // 阶段累计时长（worker 维度，跨 worker 求和）。除以 worker 数得出每 worker 平均阶段时长。
+  let completedBatches = 0; // 已被 flush worker 处理完成的 batch
+  let fetchedBatches = 0;
   const timing: BatchTiming = { fetchMs: 0, prefetchMs: 0, processMs: 0, flushMs: 0 };
 
-  async function worker() {
-    while (queue.length > 0) {
-      const job = queue.shift();
+  // Fetch worker：拉 + process → 写 channel；channel 满则 backpressure 等
+  async function fetchWorker() {
+    while (fetchQueue.length > 0) {
+      const job = fetchQueue.shift();
       if (!job) break;
+      // backpressure: 队列满则等 flush worker 消化
+      while (flushQueue.length >= QUEUE_MAX) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
       try {
-        const r = await processOneBatch(job, v4PoolManager, pcsV4ClPoolManager, bnbPricePool, timing);
+        const r = await fetchAndProcessBatch(job, v4PoolManager, pcsV4ClPoolManager, bnbPricePool, timing);
         totalLogs += r.logs;
         totalProcessed += r.processed;
         totalErrors += r.errors;
+        flushQueue.push({ buffer: r.buffer, jobIndex: job.index });
+        fetchedBatches++;
       } catch (err) {
-        console.error(`[Backfill] batch ${job.index} (${job.from}-${job.to}) failed:`, (err as Error).message);
+        console.error(`[Backfill][${SHARD_LABEL}] batch ${job.index} (${job.from}-${job.to}) fetch fail:`, (err as Error).message);
         totalErrors++;
       }
+    }
+  }
+
+  // Flush worker：从 channel 拿 buffer → 写 PG（staging 或 swaps）
+  async function flushWorker() {
+    while (!fetchersDone || flushQueue.length > 0) {
+      const item = flushQueue.shift();
+      if (!item) {
+        await new Promise((r) => setTimeout(r, 50));
+        continue;
+      }
+      const flushT0 = Date.now();
+      try {
+        if (USE_STAGING) {
+          await flushBatchBufferToStaging(item.buffer);
+        } else {
+          await flushBatchBufferSwapsOnly(item.buffer);
+        }
+      } catch (err) {
+        console.error(`[Backfill][${SHARD_LABEL}] batch ${item.jobIndex} flush fail:`, (err as Error).message);
+        totalErrors++;
+      }
+      timing.flushMs += Date.now() - flushT0;
       completedBatches++;
       if (completedBatches % 20 === 0 || completedBatches === jobs.length) {
         const pct = Math.round((completedBatches * 100) / jobs.length);
         const elapsedS = ((Date.now() - t0) / 1000).toFixed(0);
         const rate = (completedBatches / parseFloat(elapsedS)).toFixed(2);
-        // 每 batch 平均各阶段（毫秒），按 worker 维度归一（总时长/总 batch）。
-        const avgFetch = (timing.fetchMs / completedBatches).toFixed(0);
-        const avgPrefetch = (timing.prefetchMs / completedBatches).toFixed(0);
-        const avgProcess = (timing.processMs / completedBatches).toFixed(0);
+        const avgFetch = (timing.fetchMs / Math.max(fetchedBatches, 1)).toFixed(0);
+        const avgPrefetch = (timing.prefetchMs / Math.max(fetchedBatches, 1)).toFixed(0);
+        const avgProcess = (timing.processMs / Math.max(fetchedBatches, 1)).toFixed(0);
         const avgFlush = (timing.flushMs / completedBatches).toFixed(0);
         const remainBatches = jobs.length - completedBatches;
         const etaH = remainBatches / parseFloat(rate) / 3600;
         console.log(
-          `[Backfill][${SHARD_LABEL}] ${pct}% ${completedBatches}/${jobs.length} | logs=${totalLogs} ok=${totalProcessed} err=${totalErrors} | ${elapsedS}s ${rate}batch/s ETA=${etaH.toFixed(1)}h | avg ms: fetch=${avgFetch} prefetch=${avgPrefetch} process=${avgProcess} flush=${avgFlush}`
+          `[Backfill][${SHARD_LABEL}] ${pct}% ${completedBatches}/${jobs.length} (fetched=${fetchedBatches} q=${flushQueue.length}) | logs=${totalLogs} ok=${totalProcessed} err=${totalErrors} | ${elapsedS}s ${rate}batch/s ETA=${etaH.toFixed(1)}h | avg ms: fetch=${avgFetch} prefetch=${avgPrefetch} process=${avgProcess} flush=${avgFlush}`
         );
       }
     }
   }
 
-  await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+  // 启 fetch + flush worker pool
+  const fetchTasks = Array.from({ length: CONCURRENCY }, () => fetchWorker());
+  const flushTasks = Array.from({ length: FLUSH_WORKERS }, () => flushWorker());
+
+  await Promise.all(fetchTasks);
+  fetchersDone = true;
+  await Promise.all(flushTasks);
+  // ============== worker pool 结束 ==============
 
   const elapsedS = ((Date.now() - t0) / 1000).toFixed(0);
   console.log(
-    `[Backfill][${SHARD_LABEL}] swap 抓取完成 ${elapsedS}s — fetched ${totalLogs}, processed ${totalProcessed}, errors ${totalErrors}`
+    `[Backfill][${SHARD_LABEL}] swap 抓取+flush 完成 ${elapsedS}s — fetched ${totalLogs}, processed ${totalProcessed}, errors ${totalErrors}`
   );
+
+  // Staging 模式：把 staging 数据 migrate 到 swaps（hash semi-join 比逐行 ON CONFLICT 快）
+  if (USE_STAGING) {
+    console.log(`[Backfill][${SHARD_LABEL}] migrating staging → swaps（这步可能 1-2h，PG hash semi-join）`);
+    const migT0 = Date.now();
+    const r = await migrateStagingToSwaps();
+    console.log(
+      `[Backfill][${SHARD_LABEL}] migrate done ${((Date.now() - migT0) / 1000).toFixed(0)}s — staged=${r.staged}, inserted=${r.inserted}`
+    );
+  }
 
   // 跑完从 swaps 重建 buckets（彻底防 stream/backfill 双累加）。
   // 多 shard 时只让 main shard 重建（其他 shard 设 BF_SKIP_REBUILD=1）。

@@ -203,6 +203,106 @@ export async function flushBatchBufferSwapsOnly(buf: BatchBuffer): Promise<void>
   ]);
 }
 
+/**
+ * Backfill staging 模式：写到 swaps_staging（无 index，无 PK，无 unique）。
+ * - 极快：每 batch 30k swap 单 INSERT，0 conflict check, 0 B-tree update
+ * - 跑完 backfill 后调用 migrateStagingToSwaps() 一次性 INSERT INTO swaps
+ *   （PG hash semi-join，比逐行 ON CONFLICT 快 10x+）
+ */
+export async function bulkInsertSwapsStaging(swaps: SwapRecord[]): Promise<void> {
+  for (let i = 0; i < swaps.length; i += 30000) {
+    const slice = swaps.slice(i, i + 30000);
+    const poolAddrs: string[] = [];
+    const chains: string[] = [];
+    const dexes: string[] = [];
+    const txHashes: string[] = [];
+    const amount0s: string[] = [];
+    const amount1s: string[] = [];
+    const feeUsds: number[] = [];
+    const volumeUsds: number[] = [];
+    const timestamps: string[] = [];
+    const blockNumbers: string[] = [];
+    for (const s of slice) {
+      poolAddrs.push(s.poolAddress);
+      chains.push(s.chain);
+      dexes.push(s.dex);
+      txHashes.push(s.txHash);
+      amount0s.push(s.amount0);
+      amount1s.push(s.amount1);
+      feeUsds.push(s.feeUsd);
+      volumeUsds.push(s.volumeUsd);
+      timestamps.push(String(s.timestamp));
+      blockNumbers.push(String(s.blockNumber));
+    }
+    await getPool().query(
+      `INSERT INTO swaps_staging (pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number)
+       SELECT * FROM unnest(
+         $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+         $7::float8[], $8::float8[], $9::bigint[], $10::bigint[]
+       )`,
+      [poolAddrs, chains, dexes, txHashes, amount0s, amount1s, feeUsds, volumeUsds, timestamps, blockNumbers]
+    );
+  }
+}
+
+export async function flushBatchBufferToStaging(buf: BatchBuffer): Promise<void> {
+  await Promise.all([
+    buf.swaps.length ? bulkInsertSwapsStaging(buf.swaps) : Promise.resolve(),
+    buf.bnbPrices.length ? bulkInsertBnbPrice(buf.bnbPrices) : Promise.resolve(),
+  ]);
+}
+
+/** 创建 swaps_staging 表（无 index 无 PK，纯 append 写）。Idempotent。 */
+export async function createStagingTable(): Promise<void> {
+  await getPool().query(`
+    CREATE TABLE IF NOT EXISTS swaps_staging (
+      pool_address TEXT NOT NULL,
+      chain TEXT NOT NULL,
+      dex TEXT NOT NULL,
+      tx_hash TEXT NOT NULL,
+      amount0 TEXT NOT NULL,
+      amount1 TEXT NOT NULL,
+      fee_usd DOUBLE PRECISION NOT NULL,
+      volume_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+      timestamp BIGINT NOT NULL,
+      block_number BIGINT NOT NULL
+    )
+  `);
+}
+
+/**
+ * 把 swaps_staging 的数据合并到 swaps（hypertable）。
+ * - WHERE NOT EXISTS 配合 hash semi-join 比逐行 ON CONFLICT 快得多
+ * - DISTINCT ON 防 staging 内部重复（多 worker 同 batch 跑出的极小可能性）
+ * - 完成后清空 staging
+ */
+export async function migrateStagingToSwaps(): Promise<{ inserted: number; staged: number }> {
+  const stagedRes = await getPool().query<{ n: string }>(`SELECT COUNT(*)::text AS n FROM swaps_staging`);
+  const staged = Number(stagedRes.rows[0]?.n ?? 0);
+  if (staged === 0) return { inserted: 0, staged: 0 };
+
+  // 单大事务 INSERT；PG 应用 hash semi-join
+  const res = await getPool().query(`
+    INSERT INTO swaps (pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number)
+    SELECT DISTINCT ON (s.tx_hash, s.pool_address, s.amount0, s.amount1, s."timestamp")
+      s.pool_address, s.chain, s.dex, s.tx_hash, s.amount0, s.amount1, s.fee_usd, s.volume_usd, s."timestamp", s.block_number
+    FROM swaps_staging s
+    WHERE NOT EXISTS (
+      SELECT 1 FROM swaps w
+      WHERE w.tx_hash = s.tx_hash
+        AND w.pool_address = s.pool_address
+        AND w.amount0 = s.amount0
+        AND w.amount1 = s.amount1
+        AND w."timestamp" = s."timestamp"
+    )
+    ON CONFLICT DO NOTHING
+  `);
+  const inserted = res.rowCount ?? 0;
+
+  await getPool().query(`TRUNCATE swaps_staging`);
+  return { inserted, staged };
+}
+
 // ============================================================================
 // Swap / pool persistence
 // ============================================================================
