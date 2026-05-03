@@ -136,6 +136,34 @@ async function fetchTokenMetadataFromChain(
   }
 }
 
+/** 一次性预热 metadata cache：
+ *  - 从 binance_bsc_tokens DB 表拿 303 个白名单 token 的 decimals + symbol（已知字段）
+ *  - 加上 BSC 的 base tokens（USDT/USDC/USD1/WBNB），全部直接写入 cache
+ *  这样 swap-listener 处理任何 swap 时 metadata 全 cache hit，不用每次 multicall。
+ */
+export async function prewarmMetadataCache(): Promise<void> {
+  const { getAllBinanceBscTokens } = await import("../db/queries.js");
+  const tokens = await getAllBinanceBscTokens();
+  for (const t of tokens) {
+    const cacheKey = `bsc:${t.contractAddress.toLowerCase()}`;
+    TOKEN_METADATA_CACHE.set(cacheKey, {
+      symbol: t.symbol,
+      decimals: t.decimals || 18,
+    });
+  }
+  // BSC base tokens（USDT/USDC/USD1 都是 18 decimals，WBNB 18）
+  const baseTokens: Array<{ addr: string; symbol: string }> = [
+    { addr: "0x55d398326f99059ff775485246999027b3197955", symbol: "USDT" },
+    { addr: "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", symbol: "USDC" },
+    { addr: "0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d", symbol: "USD1" },
+    { addr: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", symbol: "WBNB" },
+  ];
+  for (const { addr, symbol } of baseTokens) {
+    TOKEN_METADATA_CACHE.set(`bsc:${addr}`, { symbol, decimals: 18 });
+  }
+  console.log(`[Radar] Metadata cache prewarmed: ${TOKEN_METADATA_CACHE.size} tokens`);
+}
+
 export async function getTokenPrices(
   tokens: Array<{ chain: ChainId; address: string }>
 ): Promise<Map<string, TokenPriceInfo>> {

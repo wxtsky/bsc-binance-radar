@@ -25,7 +25,7 @@ import { createPublicClient, http, parseAbiItem, type Log } from "viem";
 import { bsc } from "viem/chains";
 import { getPool, initSchema, closeDatabase } from "../src/db/index.js";
 import { CONTRACTS } from "../src/config/contracts.js";
-import { initPriceService } from "../src/core/price-service.js";
+import { initPriceService, prewarmMetadataCache } from "../src/core/price-service.js";
 import { startTokenTracker, stopTokenTracker } from "../src/token-tracker/tracker.js";
 import {
   processV3SwapLog,
@@ -48,7 +48,9 @@ function parseDuration(s: string | undefined): number {
 
 const HOURS = parseDuration(process.argv[2]);
 const CONCURRENCY = Number(process.argv[3]) || 6;
-const BLOCKS_PER_BATCH = 1000n;
+// 大 batch 减少 RPC 次数（节点 90d 前 logs 多，1000 blocks ≈ 30k logs/batch；
+// 2000 blocks ≈ 60k logs/batch，单 getLogs 仍 < 10MB JSON 节点扛得住）
+const BLOCKS_PER_BATCH = BigInt(Number(process.env.BF_BATCH_SIZE) || 2000);
 
 const HTTP_URL = process.env.BSC_HTTP_URL || "http://151.123.172.62:81";
 
@@ -224,6 +226,8 @@ async function main() {
   await initSchema();
   await startTokenTracker();
   await initPriceService();
+  // Prewarm metadata cache from DB（白名单 303 + base tokens 4），让 process 函数 0 RPC for metadata
+  await prewarmMetadataCache();
 
   const latest = await httpClient.getBlockNumber();
 
