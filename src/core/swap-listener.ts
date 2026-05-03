@@ -489,12 +489,15 @@ export async function processV2BnbPriceSwap(
     const stableIn = wbnbIs1 ? amt0In : amt1In;
     const stableOut = wbnbIs1 ? amt0Out : amt1Out;
 
-    let priceUsd = 0;
+    // 用 BigInt 缩放避免大数 → Number 丢精度（USDT amount 1e18+ > 2^53 ≈ 9e15）
+    const SCALE = 1_000_000n;
+    let priceScaled = 0n;
     if (wbnbOut > 0n && stableIn > 0n) {
-      priceUsd = Number(stableIn) / Number(wbnbOut);
+      priceScaled = (stableIn * SCALE) / wbnbOut;
     } else if (wbnbIn > 0n && stableOut > 0n) {
-      priceUsd = Number(stableOut) / Number(wbnbIn);
+      priceScaled = (stableOut * SCALE) / wbnbIn;
     }
+    const priceUsd = Number(priceScaled) / Number(SCALE);
 
     // BSC USDT 18 decimals, WBNB 18 decimals → ratio 不需 decimals 调整
     if (!Number.isFinite(priceUsd) || priceUsd <= 0 || priceUsd > 100_000) return;
@@ -536,8 +539,8 @@ async function getPcsV4ClPoolInfo(
   if (pcsV4PoolInfoCache.has(cacheKey)) return pcsV4PoolInfoCache.get(cacheKey)!;
   if (invalidPcsV4PoolCache.has(cacheKey)) return null;
 
-  // 复用 v4_pools 表存（chain 加前缀区分）
-  const dbPool = await getV4Pool(`pcsv4:${poolId}`, chain);
+  // 复用 v4_pools 表存（用 'pcsv4cl:' 前缀区分 namespace，避免与 UniV4 PoolId 撞）
+  const dbPool = await getV4Pool(`pcsv4cl:${poolId}`, chain);
   if (dbPool) {
     pcsV4PoolInfoCache.set(cacheKey, dbPool);
     return dbPool;
@@ -579,7 +582,7 @@ async function getPcsV4ClPoolInfo(
       hooks,
     };
     pcsV4PoolInfoCache.set(cacheKey, info);
-    await upsertV4Pool(`pcsv4:${poolId}`, chain, info);
+    await upsertV4Pool(`pcsv4cl:${poolId}`, chain, info);
     return info;
   } catch {
     invalidPcsV4PoolCache.add(cacheKey);
@@ -659,8 +662,11 @@ export async function processPcsV4ClSwapLog(
 
     const timestamp = overrideTimestamp ?? Date.now();
     const safeVolume = Number.isFinite(volumeUsd) ? volumeUsd : 0;
+    // 用 'pcsv4cl:' 前缀作为 swaps.pool_address，跟 v4_pools.pool_id 一致
+    // → rebuildBucketsFromSwaps 的 JOIN（pool_id = swaps.pool_address）能匹配上
+    const namespacedPoolId = `pcsv4cl:${poolId}`;
     const swap: SwapRecord = {
-      poolAddress: poolId,
+      poolAddress: namespacedPoolId,
       chain,
       dex: "pancakeswap-v4-cl",
       txHash: log.transactionHash || "",
@@ -675,12 +681,12 @@ export async function processPcsV4ClSwapLog(
     const bucketStart = Math.floor(timestamp / 60_000) * 60_000;
     if (buffer) {
       bufferAddSwap(buffer, swap);
-      bufferAddPoolBucket(buffer, poolId, chain, bucketStart, totalFeeUsd, safeVolume);
+      bufferAddPoolBucket(buffer, namespacedPoolId, chain, bucketStart, totalFeeUsd, safeVolume);
       bufferAddTokenBucket(buffer, target, chain, bucketStart, safeVolume, totalFeeUsd);
     } else {
       await Promise.all([
         insertSwap(swap),
-        upsertPool1minStat(poolId, chain, bucketStart, totalFeeUsd, safeVolume),
+        upsertPool1minStat(namespacedPoolId, chain, bucketStart, totalFeeUsd, safeVolume),
         upsertToken1minStat(target, chain, bucketStart, safeVolume, totalFeeUsd),
       ]);
     }
