@@ -3,6 +3,28 @@ services:
     image: postgres:17-alpine
     container_name: radar-pg
     restart: unless-stopped
+    # 调优：服务器 7.8GB RAM，数据库 ~50GB；shared_buffers 2GB 让索引基本 cache 内存
+    # 避免 ON CONFLICT (uq_swaps_dedup) 时大量 random read 落磁盘 → DataFileRead wait
+    command:
+      - postgres
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - effective_cache_size=5GB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - max_connections=100
+      - -c
+      - synchronous_commit=off
     environment:
       POSTGRES_DB: radar
       POSTGRES_USER: radar
