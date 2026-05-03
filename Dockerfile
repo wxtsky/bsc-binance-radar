@@ -9,7 +9,7 @@ WORKDIR /app
 
 # 系统依赖（rustls 用 ring，不需要 libssl-dev；为 reqwest features 已切 rustls-tls）
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config build-essential \
+    pkg-config build-essential libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # 先 copy Cargo.toml 缓存依赖（如果不变就走 cache）
