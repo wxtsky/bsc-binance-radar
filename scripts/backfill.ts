@@ -71,10 +71,14 @@ const V2_SWAP = parseAbiItem(
 
 const httpClient = createPublicClient({
   chain: bsc,
-  // ⚠️ 不开 transport batch：getLogs 90d 前数据量大，合并多个 getLogs response 容易
-  // 超过节点 max response size 触发 "response too large" 错误。
-  // 只用 client.batch.multicall（合约层 multicall3 batch readContract）。
-  transport: http(HTTP_URL, { timeout: 30_000, retryCount: 2 }),
+  // transport batch 小 size：合最多 2 个 RPC 到 1 个 HTTP request 减半 round trip。
+  // batchSize=2 控制 response 上限 ≤ 10MB（节点 30MB limit 内安全），
+  // 不会触发 "response too large"。
+  transport: http(HTTP_URL, {
+    timeout: 30_000,
+    retryCount: 2,
+    batch: { wait: 10, batchSize: 2 },
+  }),
   batch: { multicall: true },
 });
 
