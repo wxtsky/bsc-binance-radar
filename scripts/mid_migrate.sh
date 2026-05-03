@@ -58,7 +58,11 @@ SELECT COALESCE((SELECT COUNT(*) FROM ins),0)::text || '|' || COALESCE((SELECT C
   fi
 done
 
-echo "=== $(date) === DONE batches=$BATCHES_DONE" >> "$LOG"
+echo "=== $(date) === DONE batches=$BATCHES_DONE，VACUUM 释放空间" >> "$LOG"
+# DELETE 只标记 dead tuples，VACUUM 释放给磁盘
+docker exec radar-pg psql -U radar -d radar -c "VACUUM swaps_staging" >> "$LOG" 2>&1
+
 docker exec radar-pg psql -U radar -d radar -c "
 SELECT (SELECT COUNT(*) FROM swaps) AS swaps, (SELECT COUNT(*) FROM swaps_staging) AS staging,
+       pg_size_pretty(pg_total_relation_size('swaps_staging')) AS staging_size,
        pg_size_pretty(pg_database_size('radar')) AS db_size" >> "$LOG" 2>&1
