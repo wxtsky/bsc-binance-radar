@@ -53,7 +53,14 @@ const CONCURRENCY = Number(process.argv[3]) || Number(process.env.BF_CONCURRENCY
 // 默认 1000 blocks/batch（30d 测过最稳）。BF_BATCH_SIZE 可覆盖。
 const BLOCKS_PER_BATCH = BigInt(Number(process.env.BF_BATCH_SIZE) || 1000);
 
-const HTTP_URL = process.env.BSC_HTTP_URL || "http://151.123.172.62:81";
+// 多 RPC 节点 sharding 用：BF_RPC_URL 覆盖默认节点（如 NodeReal 公网）；
+// BF_FROM_BLOCK / BF_TO_BLOCK 显式指定 block 范围（覆盖 HOURS 算的 latest-90d）。
+// 跑完不重建 buckets：BF_SKIP_REBUILD=1（多 shard 跑时只让最后一个 shard 重建）。
+const HTTP_URL = process.env.BF_RPC_URL || process.env.BSC_HTTP_URL || "http://151.123.172.62:81";
+const FROM_BLOCK_OVERRIDE = process.env.BF_FROM_BLOCK ? BigInt(process.env.BF_FROM_BLOCK) : null;
+const TO_BLOCK_OVERRIDE = process.env.BF_TO_BLOCK ? BigInt(process.env.BF_TO_BLOCK) : null;
+const SKIP_REBUILD = process.env.BF_SKIP_REBUILD === "1";
+const SHARD_LABEL = process.env.BF_SHARD_LABEL || "main";
 
 const V3_SWAP = parseAbiItem(
   "event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)"
@@ -248,7 +255,9 @@ async function processOneBatch(
 }
 
 async function main() {
-  console.log(`[Backfill] ${HOURS}h, concurrency=${CONCURRENCY}, batch=${BLOCKS_PER_BATCH} blocks via ${HTTP_URL}`);
+  console.log(
+    `[Backfill][${SHARD_LABEL}] ${HOURS}h, concurrency=${CONCURRENCY}, batch=${BLOCKS_PER_BATCH} blocks via ${HTTP_URL}`
+  );
 
   await initSchema();
   await startTokenTracker();
@@ -258,7 +267,8 @@ async function main() {
 
   const latest = await httpClient.getBlockNumber();
 
-  // probe 真实块时间
+  // probe 真实块时间（rangeStartMs 用于 rebuild 时；shard 模式下 shard0 不重建，
+  // 让 main shard 跑完再做整体 rebuild）。
   const PROBE_DISTANCE = 1000n;
   const [latestBlk, probeBlk] = await Promise.all([
     httpClient.getBlock({ blockNumber: latest }),
@@ -267,9 +277,12 @@ async function main() {
   const realBlockTimeS =
     (Number(latestBlk.timestamp) - Number(probeBlk.timestamp)) / Number(PROBE_DISTANCE);
   const TOTAL_BLOCKS = BigInt(Math.ceil((HOURS * 3600) / realBlockTimeS));
-  const start = latest - TOTAL_BLOCKS;
+
+  // 选 range：override 优先，否则 latest-90d → latest
+  const start = FROM_BLOCK_OVERRIDE ?? latest - TOTAL_BLOCKS;
+  const end = TO_BLOCK_OVERRIDE ?? latest;
   console.log(
-    `[Backfill] block time ${realBlockTimeS.toFixed(3)}s; ${TOTAL_BLOCKS} blocks; range ${start} → ${latest}`
+    `[Backfill][${SHARD_LABEL}] block time ${realBlockTimeS.toFixed(3)}s; range ${start} → ${end} (${end - start} blocks)`
   );
 
   // 幂等保护：
@@ -277,16 +290,18 @@ async function main() {
   //   pool/token 1min_stats 跑完后从 swaps 重建（不再依赖 backfill 中间累加状态）
   const latestTsMs = Number(latestBlk.timestamp) * 1000;
   const rangeStartMs = latestTsMs - HOURS * 3600 * 1000 - 60_000;
-  console.log(`[Backfill] 时间范围 ${new Date(rangeStartMs).toISOString()} → ${new Date(latestTsMs).toISOString()}`);
+  console.log(
+    `[Backfill][${SHARD_LABEL}] 时间范围 ${new Date(rangeStartMs).toISOString()} → ${new Date(latestTsMs).toISOString()}`
+  );
 
-  // 切 jobs
+  // 切 jobs（end 替代 latest，支持 BF_TO_BLOCK override）
   const jobs: BatchJob[] = [];
   let idx = 0;
-  for (let from = start; from < latest; from += BLOCKS_PER_BATCH) {
-    const to = from + BLOCKS_PER_BATCH - 1n > latest ? latest : from + BLOCKS_PER_BATCH - 1n;
+  for (let from = start; from < end; from += BLOCKS_PER_BATCH) {
+    const to = from + BLOCKS_PER_BATCH - 1n > end ? end : from + BLOCKS_PER_BATCH - 1n;
     jobs.push({ from, to, index: idx++ });
   }
-  console.log(`[Backfill] ${jobs.length} batches`);
+  console.log(`[Backfill][${SHARD_LABEL}] ${jobs.length} batches`);
 
   const v4PoolManager = CONTRACTS.bsc.uniswapV4PoolManager as `0x${string}`;
   const pcsV4ClPoolManager = CONTRACTS.bsc.pancakeswapV4ClPoolManager as `0x${string}`;
@@ -328,7 +343,7 @@ async function main() {
         const remainBatches = jobs.length - completedBatches;
         const etaH = remainBatches / parseFloat(rate) / 3600;
         console.log(
-          `[Backfill] ${pct}% ${completedBatches}/${jobs.length} | logs=${totalLogs} ok=${totalProcessed} err=${totalErrors} | ${elapsedS}s ${rate}batch/s ETA=${etaH.toFixed(1)}h | avg ms: fetch=${avgFetch} prefetch=${avgPrefetch} process=${avgProcess} flush=${avgFlush}`
+          `[Backfill][${SHARD_LABEL}] ${pct}% ${completedBatches}/${jobs.length} | logs=${totalLogs} ok=${totalProcessed} err=${totalErrors} | ${elapsedS}s ${rate}batch/s ETA=${etaH.toFixed(1)}h | avg ms: fetch=${avgFetch} prefetch=${avgPrefetch} process=${avgProcess} flush=${avgFlush}`
         );
       }
     }
@@ -338,11 +353,16 @@ async function main() {
 
   const elapsedS = ((Date.now() - t0) / 1000).toFixed(0);
   console.log(
-    `[Backfill] swap 抓取完成 ${elapsedS}s — fetched ${totalLogs}, processed ${totalProcessed}, errors ${totalErrors}`
+    `[Backfill][${SHARD_LABEL}] swap 抓取完成 ${elapsedS}s — fetched ${totalLogs}, processed ${totalProcessed}, errors ${totalErrors}`
   );
 
-  // 跑完从 swaps 重建 buckets（彻底防 stream/backfill 双累加）
-  await rebuildBucketsFromSwaps(rangeStartMs);
+  // 跑完从 swaps 重建 buckets（彻底防 stream/backfill 双累加）。
+  // 多 shard 时只让 main shard 重建（其他 shard 设 BF_SKIP_REBUILD=1）。
+  if (SKIP_REBUILD) {
+    console.log(`[Backfill][${SHARD_LABEL}] skip rebuild (BF_SKIP_REBUILD=1)`);
+  } else {
+    await rebuildBucketsFromSwaps(rangeStartMs);
+  }
 
   stopTokenTracker();
   await closeDatabase();
