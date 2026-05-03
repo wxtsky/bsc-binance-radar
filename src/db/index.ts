@@ -21,7 +21,9 @@ export function getPool(): pg.Pool {
   if (!pool) {
     pool = new Pool({
       connectionString: getConnectionString(),
-      max: 10,
+      // backfill 8 worker × 4 并行 INSERT = 32 connection 需求；max=10 会排队。
+      // PG 默认 max_connections=100，留 buffer 给 stream + 维护查询。
+      max: Number(process.env.PG_POOL_MAX) || 40,
       idleTimeoutMillis: 30_000,
     });
     pool.on("error", (err) => {
