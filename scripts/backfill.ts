@@ -69,6 +69,7 @@ const BLOCKS_PER_BATCH = BigInt(Number(process.env.BF_BATCH_SIZE) || 1000);
 // BF_FROM_BLOCK / BF_TO_BLOCK 显式指定 block 范围（覆盖 HOURS 算的 latest-90d）。
 // 跑完不重建 buckets：BF_SKIP_REBUILD=1（多 shard 跑时只让最后一个 shard 重建）。
 const HTTP_URL = process.env.BF_RPC_URL || process.env.BSC_HTTP_URL || "http://151.123.172.62:81";
+
 const FROM_BLOCK_OVERRIDE = process.env.BF_FROM_BLOCK ? BigInt(process.env.BF_FROM_BLOCK) : null;
 const TO_BLOCK_OVERRIDE = process.env.BF_TO_BLOCK ? BigInt(process.env.BF_TO_BLOCK) : null;
 const SKIP_REBUILD = process.env.BF_SKIP_REBUILD === "1";
@@ -129,6 +130,7 @@ const httpClient = createPublicClient({
   batch: { multicall: true },
 });
 
+
 interface BatchJob {
   from: bigint;
   to: bigint;
@@ -143,82 +145,27 @@ interface BatchTiming {
 }
 
 /**
- * 启动时一次性 discover：拉 V3/PCS V3 Factory 的 **全历史** PoolCreated 事件
- * （从 V3 BSC deploy block 扫到 latest），filter 至少含一个白名单 token 的池子，
- * 得到精确的 pool address whitelist。
+ * 启动时从 pools 表读所有已知 V3/PCS V3 池子地址，作为 swap getLogs 的 address filter。
  *
- * ⚠️ 必须扫全历史不能只扫 90d —— 否则漏掉「90d 之前创建、但 90d 内有 swap 的老池子」。
+ * 之前 30d backfill 已经覆盖 30d 内活跃池子 → 都在 pools 表（~14k 个）。
+ * backfill V3/PCS V3 swap getLogs 加 `address: [...这些池子]`，节点直接过滤，
+ * 数据量 1/30，fetch 24s → 2-4s。
  *
- * 之后 backfill 主循环 V3/PCS V3 swap getLogs 只查这些 pool address，
- * 节点直接过滤 → 数据量 1/30，fetch 时长从 24s → 2-4s。
- *
- * 同时 PoolCreated event 自带 token0/token1/fee，可以直接 upsert pools 表，
- * 后续 backfill prefetch 几乎全 cache hit（multicall 几乎不跑）。
- *
- * 启动开销：~71M blocks / 200K blocks/call = 355 calls × ~1.5s = 5-9 分钟。
- * 节省：backfill ETA 30h → 5-7h，净赚 24h。
+ * 漏掉的边界：30-90d 之间新创建、且 30d backfill 没扫到的池子（数量极小，可接受）。
+ * 0 RPC 启动开销 —— 直接 PG SELECT。
  */
-const V3_BSC_DEPLOY_BLOCK = 25_000_000n; // 保守起点（V3 实际 deploy ~26.9M）
-
-async function discoverWhitelistedPools(
-  toBlock: bigint,
-  whitelistedTokens: Set<string>
-): Promise<{ v3: `0x${string}`[]; pcsV3: `0x${string}`[] }> {
-  const fromBlock = V3_BSC_DEPLOY_BLOCK;
-  const uniFactory = CONTRACTS.bsc.uniswapV3Factory as `0x${string}`;
-  const pcsFactory = CONTRACTS.bsc.pancakeswapV3Factory as `0x${string}`;
-  const totalBlocks = toBlock - fromBlock;
-  console.log(`[Discover] 全历史扫 V3/PCS V3 PoolCreated (${fromBlock} → ${toBlock}, ${totalBlocks} blocks)...`);
+async function discoverWhitelistedPools(): Promise<{ v3: `0x${string}`[]; pcsV3: `0x${string}`[] }> {
+  console.log(`[Discover] 从 pools 表读已知 V3/PCS V3 池子...`);
   const t0 = Date.now();
-
-  // 200k blocks/call，节点应该能扛单次返回（PoolCreated 事件相对稀疏）
-  const STEP = 200000n;
-  const v3: `0x${string}`[] = [];
-  const pcsV3: `0x${string}`[] = [];
-  const allUpserts: Array<{ address: string; chain: "bsc"; dex: "uniswap-v3" | "pancakeswap-v3"; token0: string; token1: string; feeTier: number }> = [];
-
-  let scanned = 0n;
-  for (let from = fromBlock; from < toBlock; from += STEP) {
-    const to = from + STEP - 1n > toBlock ? toBlock : from + STEP - 1n;
-    const [uniLogs, pcsLogs] = await Promise.all([
-      httpClient.getLogs({ address: uniFactory, fromBlock: from, toBlock: to, event: V3_POOL_CREATED }),
-      httpClient.getLogs({ address: pcsFactory, fromBlock: from, toBlock: to, event: V3_POOL_CREATED }),
-    ]);
-    scanned += to - from + 1n;
-    if ((from - fromBlock) % (STEP * 20n) === 0n) {
-      const pct = Number((scanned * 100n) / totalBlocks);
-      const elapsedS = ((Date.now() - t0) / 1000).toFixed(0);
-      console.log(`[Discover] ${pct}% block ${to} | v3=${v3.length} pcsV3=${pcsV3.length} | ${elapsedS}s`);
-    }
-
-    for (const log of uniLogs) {
-      const a = log.args as { token0?: string; token1?: string; fee?: number; pool?: string };
-      if (!a.token0 || !a.token1 || !a.pool || a.fee === undefined) continue;
-      const t0l = a.token0.toLowerCase();
-      const t1l = a.token1.toLowerCase();
-      if (whitelistedTokens.has(t0l) || whitelistedTokens.has(t1l)) {
-        v3.push(a.pool as `0x${string}`);
-        allUpserts.push({ address: a.pool.toLowerCase(), chain: "bsc", dex: "uniswap-v3", token0: t0l, token1: t1l, feeTier: Number(a.fee) });
-      }
-    }
-    for (const log of pcsLogs) {
-      const a = log.args as { token0?: string; token1?: string; fee?: number; pool?: string };
-      if (!a.token0 || !a.token1 || !a.pool || a.fee === undefined) continue;
-      const t0l = a.token0.toLowerCase();
-      const t1l = a.token1.toLowerCase();
-      if (whitelistedTokens.has(t0l) || whitelistedTokens.has(t1l)) {
-        pcsV3.push(a.pool as `0x${string}`);
-        allUpserts.push({ address: a.pool.toLowerCase(), chain: "bsc", dex: "pancakeswap-v3", token0: t0l, token1: t1l, feeTier: Number(a.fee) });
-      }
-    }
-  }
-
-  // 一次性 upsert pools 表 → backfill 主循环 prefetch 全 cache hit
-  if (allUpserts.length > 0) {
-    await bulkUpsertPools(allUpserts);
-  }
-
-  console.log(`[Discover] V3 完成 ${((Date.now() - t0) / 1000).toFixed(0)}s — V3=${v3.length} 池, PCS V3=${pcsV3.length} 池, 已 upsert pools 表`);
+  const v3Res = await getPool().query<{ address: string }>(
+    `SELECT address FROM pools WHERE chain='bsc' AND dex='uniswap-v3'`
+  );
+  const pcsRes = await getPool().query<{ address: string }>(
+    `SELECT address FROM pools WHERE chain='bsc' AND dex='pancakeswap-v3'`
+  );
+  const v3 = v3Res.rows.map((r) => r.address as `0x${string}`);
+  const pcsV3 = pcsRes.rows.map((r) => r.address as `0x${string}`);
+  console.log(`[Discover] V3=${v3.length} 池, PCS V3=${pcsV3.length} 池 (${((Date.now() - t0) / 1000).toFixed(1)}s, 0 RPC)`);
   return { v3, pcsV3 };
 }
 
@@ -250,8 +197,8 @@ async function discoverV4Pools(
   for (let from = fromBlock; from < toBlock; from += STEP) {
     const to = from + STEP - 1n > toBlock ? toBlock : from + STEP - 1n;
     const [v4Logs, pcsLogs] = await Promise.all([
-      httpClient.getLogs({ address: v4PoolManager, fromBlock: from, toBlock: to, event: V4_INITIALIZE }).catch(() => []),
-      httpClient.getLogs({ address: pcsV4ClPoolManager, fromBlock: from, toBlock: to, event: PCS_V4_CL_INITIALIZE }).catch(() => []),
+      discoveryClient.getLogs({ address: v4PoolManager, fromBlock: from, toBlock: to, event: V4_INITIALIZE }).catch(() => []),
+      discoveryClient.getLogs({ address: pcsV4ClPoolManager, fromBlock: from, toBlock: to, event: PCS_V4_CL_INITIALIZE }).catch(() => []),
     ]);
     scanned += to - from + 1n;
 

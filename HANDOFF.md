@@ -1,6 +1,6 @@
 # bsc-binance-radar 交接文档
 
-更新时间：2026-05-03
+更新时间：2026-05-03（晚 — 远程清空 + 策略调整中）
 
 ## 项目目标
 
@@ -8,22 +8,54 @@
 
 新增 4 维 AND 门「启动信号」回测算法（未合入生产，见 `scripts/backtest-launch-detector.ts`）。
 
-## 当前状态
+## 当前状态（2026-05-03 中断重启点）
 
-- ✅ **生产 stream 部署中**，跑在 `107.175.35.109:/opt/bsc-binance-radar`（Docker）
-- ✅ 飞书 webhook 工作正常
-- ✅ 白名单 **303 个 token**（含 LAB / 币安人生 / 4 个中文系列）
-- ✅ **PG 已迁移到 TimescaleDB**（image `timescale/timescaledb:latest-pg17`），`swaps` 表 hypertable 9 chunks（每 7d 一个）。**stream INSERT 速度恒定不会随表增长劣化，老 chunk 可一行 `drop_chunks()` 归档**
-- 🔄 **90d 历史 backfill 跑中**（2026-02-02 ~ 现在），仅自建节点 + staging 模式 + 拆 worker
-  - tmux `bf-self`：跑 block 78852395 → 96092395（全 90d，17240 batches）
-  - 模式：fetcher × 8 写 `swaps_staging`（无 index），跑完一次性 migrate 到 swaps hypertable（PG hash semi-join）
-  - 设了 `BF_SKIP_REBUILD=1`，**跑完后必须手动跑 `scripts/rebuild-buckets.ts 90d`** 重建 buckets
-- ✅ **PancakeSwap V4 CL** 池监控已上线（dex=`pancakeswap-v4-cl`）
-- ✅ **PancakeSwap V2 WBNB/USDT** 池监控（仅记录 BNB 历史价 → `bnb_price_history` 表）
-- ✅ **swaps 唯一索引** `uq_swaps_dedup(tx_hash, pool_address, amount0, amount1, timestamp)` —— hypertable 要求 unique 包含 partition key (timestamp)
-- ✅ **PG 调优**：shared_buffers 2GB + TimescaleDB hypertable + backfill 8 项性能优化（见下文 § 16）
-- ✅ 4 维 AND 门启动信号回测器（spec + 报告齐全，未合入生产）
-- ⏳ Phase 4：把启动信号合入生产 detector，未做
+⚠️ **远程服务全部停了**，正在策略调整中：
+- `docker compose down` 跑过，所有容器（radar-pg / radar-app）已 remove
+- PG volume `bsc-binance-radar_radar-pg-data` 已 `docker volume rm` —— **38GB 历史数据全删了**
+- 服务器只剩项目代码 `/opt/bsc-binance-radar`（git repo）+ `backups/` 目录
+- detector / 飞书报警 全部停止，stream 不在跑
+- 本地 PG（radar-pg @ localhost:5434）还在跑 postgres:17-alpine（image 没切 timescale）
+
+⚠️ **进行中的优化方案（未跑通）**：
+- backfill.ts 已改造拆 fetch/flush worker + staging 表（无 index 极快） + 简化版 V3 pool address filter（`SELECT pools 表`）
+- **阻塞**：远程 pools 表清了，address filter 是空数组 → V3 swap getLogs 返回 0 logs
+- 下一步要么 restore dump、要么扫 PoolCreated 全历史、要么放弃 filter 重新累积
+
+⚠️ **TimescaleDB 已切换**（远程 docker-compose.yml 改到 `timescale/timescaledb:latest-pg17`）但 volume 删了所以下次启动是 fresh init，会跑 `db/init.sql` 创建 hypertable。本地 docker-compose.yml 还是 postgres:17-alpine 没切。
+
+✅ 白名单 **303 个 token**（含 LAB / 币安人生 / 4 个中文系列）—— 配置在 `seed/binance-perpetuals.json` + 启动时 tracker 重拉
+✅ **PancakeSwap V4 CL** 池监控代码已上线（dex=`pancakeswap-v4-cl`）
+✅ **PancakeSwap V2 WBNB/USDT** 池监控代码已上线（仅记录 BNB 历史价 → `bnb_price_history` 表）
+✅ **swaps 唯一索引** `uq_swaps_dedup(tx_hash, pool_address, amount0, amount1, timestamp)` —— hypertable 要求 unique 包含 partition key (timestamp)
+✅ 4 维 AND 门启动信号回测器（spec + 报告齐全，未合入生产）
+⏳ Phase 4：把启动信号合入生产 detector，未做
+
+## 决策点（待 Bro 确认下一步）
+
+要重启项目，4 个路径选一个：
+
+**A. PoolCreated 全历史扫描**（启动 5-15 分钟，预期 backfill ETA 6-8h）
+- 扫 V3/PCS V3 Factory + V4/PCS V4 CL PoolManager 的 Initialize 事件
+- ⚠️ 之前测 PCS V3 Factory `0x0BFb...` 在 30M block 期 0 events，**factory 地址 / 事件签名待 verify**
+- 用 NodeReal archive node（自建节点 prune 了 ~1y 老 logs，"header not found"）
+- NodeReal 50K blocks/call 上限：71M / 50K = 1420 calls，并发 8 = ~3 分钟
+
+**B. 跑 raw backfill + staging（无 address filter）**（预期 ETA ~22h）
+- fetch 24s（节点不过滤）+ flush 1-2s（staging 极快）+ prefetch 慢（pools 表空全 multicall，慢慢累积）
+- 工程量 0，代码已就绪
+- 边跑边累积 pools 表
+
+**C. Restore PG dump**（拿到 14k 池子地址）
+- 远程 `backups/radar-pre-30d-20260502_1559.sql.gz`（155MB）—— 清 volume **不影响 backups/ 目录**
+- restore 后 pools 表有 14k 池子地址，能走「SELECT pools 做 filter」
+- 需要 ssh 验证 dump 是否还在 + dump 兼容 timescale schema 改动（PK + unique 5 列）—— dump 是改造前的，schema 不一致，需要单独 restore pools / v4_pools 表（不动 swaps）
+
+**D. 接受 ~22h ETA，跑 B 路径就行**
+
+## Bro 偏好
+
+「先在本地做好，再弄远程的事」—— 当前本地 docker-compose.yml 还是 postgres:17，没切 timescale，待切换后才能本地跑。
 
 ## 关键链接 / 资源
 
