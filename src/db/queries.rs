@@ -261,10 +261,11 @@ pub async fn bulk_insert_swaps_staging(swaps: &[SwapRecord]) -> Result<()> {
     let client = get_pool().get().await?;
 
     for chunk in swaps.chunks(5000) {
-        let pool_addrs: Vec<&[u8]> = chunk.iter().map(|s| s.pool_address.as_slice()).collect();
+        // tokio_postgres 不能 serialize Vec<&[u8]> → bytea[]，要 owned Vec<Vec<u8>>
+        let pool_addrs: Vec<Vec<u8>> = chunk.iter().map(|s| s.pool_address.clone()).collect();
         let chains: Vec<i16> = chunk.iter().map(|s| s.chain).collect();
         let dexs: Vec<i16> = chunk.iter().map(|s| s.dex.as_db_smallint()).collect();
-        let tx_hashes: Vec<&[u8]> = chunk.iter().map(|s| s.tx_hash.as_slice()).collect();
+        let tx_hashes: Vec<Vec<u8>> = chunk.iter().map(|s| s.tx_hash.as_slice().to_vec()).collect();
         let amount0s: Vec<String> = chunk.iter().map(|s| s.amount0.to_string()).collect();
         let amount1s: Vec<String> = chunk.iter().map(|s| s.amount1.to_string()).collect();
         let fee_usds: Vec<f64> = chunk.iter().map(|s| s.fee_usd).collect();
