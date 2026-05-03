@@ -1,48 +1,69 @@
 #!/bin/bash
-# mid-flight migrate helper：staging → swaps，每 30 分钟跑一次
-# 在 backfill 仍在写 staging 时跑（不冲突，因为 staging 是 UNLOGGED + 老行不会被 backfill 覆盖）
+# mid-flight migrate helper：staging → swaps，分小批做
+# 每次只 migrate cutoff 之前的 1M rows，避免单事务过大
 #
-# 用法（remote 上 root crontab 或 tmux 跑）：
-#   while true; do bash scripts/mid_migrate.sh; sleep 1800; done
+# 用法：tmux 后台 cron-like 跑
+#   tmux new -d -s mid-mig 'while true; do bash scripts/mid_migrate.sh; sleep 600; done'
 
 set -e
 cd "$(dirname "$0")/.."
 
 LOG=backups/mid-migrate-$(date +%Y%m%d).log
-echo "=== $(date) ===" >> "$LOG"
+echo "=== $(date) === BATCH MIGRATE START" >> "$LOG"
 
-# 当前 staging size
+# staging 状态
 docker exec radar-pg psql -U radar -d radar -c "
 SELECT
   COUNT(*) AS rows,
   pg_size_pretty(pg_total_relation_size('swaps_staging')) AS staging_size,
-  pg_size_pretty(pg_database_size('radar')) AS db_size,
-  MIN(timestamp) AS min_ts, MAX(timestamp) AS max_ts
+  pg_size_pretty(pg_database_size('radar')) AS db_size
 FROM swaps_staging;" >> "$LOG" 2>&1
 
-# 取 staging 中前 80% timestamp 作 cutoff（保留最新 20% 给 backfill 写入避开锁）
+# 取 cutoff：staging 80% 时间点
 CUTOFF=$(docker exec radar-pg psql -U radar -d radar -t -c "
-SELECT MIN(timestamp) + (MAX(timestamp) - MIN(timestamp)) * 80 / 100 FROM swaps_staging" | tr -d ' ')
+SELECT COALESCE(MIN(timestamp) + (MAX(timestamp) - MIN(timestamp)) * 80 / 100, 0)::text FROM swaps_staging" | tr -d ' ')
 
-if [ -z "$CUTOFF" ] || [ "$CUTOFF" = "" ]; then
+if [ -z "$CUTOFF" ] || [ "$CUTOFF" = "0" ]; then
   echo "staging 空，跳过" >> "$LOG"
   exit 0
 fi
 
-echo "Migrate staging WHERE timestamp < $CUTOFF" >> "$LOG"
+# 分批：每次 INSERT/DELETE 100K rows，循环到 cutoff 之前的全部 migrate 完
+BATCHES_DONE=0
+while true; do
+  RESULT=$(docker exec radar-pg psql -U radar -d radar -t -A -F'|' -c "
+WITH batch AS (
+  SELECT ctid FROM swaps_staging
+  WHERE timestamp < $CUTOFF
+  LIMIT 100000
+),
+ins AS (
+  INSERT INTO swaps (pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number)
+  SELECT s.pool_address, s.chain, s.dex, s.tx_hash, s.amount0, s.amount1, s.fee_usd, s.volume_usd, s.timestamp, s.block_number
+  FROM swaps_staging s WHERE s.ctid IN (SELECT ctid FROM batch)
+  ON CONFLICT (tx_hash, pool_address, amount0, amount1, timestamp) DO NOTHING
+  RETURNING 1
+),
+del AS (
+  DELETE FROM swaps_staging WHERE ctid IN (SELECT ctid FROM batch)
+  RETURNING 1
+)
+SELECT COALESCE((SELECT COUNT(*) FROM ins), 0)::text || '|' || COALESCE((SELECT COUNT(*) FROM del), 0)::text;
+" 2>/dev/null | tr -d '\r' | tr -d ' ')
 
-# 单事务：INSERT swaps + DELETE staging
-# 用 ON CONFLICT DO NOTHING 兜底 staging 内重复 + swaps 已存在去重，不用 DISTINCT ON 大 sort
-docker exec radar-pg psql -U radar -d radar -c "
-BEGIN;
-INSERT INTO swaps (pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number)
-SELECT pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number
-FROM swaps_staging
-WHERE timestamp < $CUTOFF
-ON CONFLICT (tx_hash, pool_address, amount0, amount1, timestamp) DO NOTHING;
-DELETE FROM swaps_staging WHERE timestamp < $CUTOFF;
-COMMIT;" >> "$LOG" 2>&1
+  BATCHES_DONE=$((BATCHES_DONE + 1))
+  echo "  batch $BATCHES_DONE: $RESULT" >> "$LOG"
+  DELETED=$(echo "$RESULT" | cut -d'|' -f2)
+  if [ -z "$DELETED" ] || [ "$DELETED" = "0" ]; then
+    break
+  fi
+  # 防 runaway
+  if [ "$BATCHES_DONE" -gt 1000 ]; then
+    echo "  too many batches, break" >> "$LOG"
+    break
+  fi
+done
 
-echo "Done. New staging size:" >> "$LOG"
+echo "=== $(date) === DONE batches=$BATCHES_DONE" >> "$LOG"
 docker exec radar-pg psql -U radar -d radar -c "
-SELECT COUNT(*) AS rows, pg_size_pretty(pg_total_relation_size('swaps_staging')) AS size FROM swaps_staging" >> "$LOG" 2>&1
+SELECT (SELECT COUNT(*) FROM swaps) AS swaps, (SELECT COUNT(*) FROM swaps_staging) AS staging, pg_size_pretty(pg_database_size('radar')) AS db_size" >> "$LOG" 2>&1
