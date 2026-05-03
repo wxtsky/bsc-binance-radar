@@ -244,6 +244,140 @@ export async function getPoolRecord(address: string, chain: ChainId): Promise<Po
   return res.rows[0] ?? null;
 }
 
+/**
+ * 批量查 pool 元信息。返回 Map<lowercase address, PoolInfo>，缺失的不在 map 里。
+ * 用于 backfill prefetch 阶段单次 SQL 替代 N+1 SELECT，显著降低 PG round-trip。
+ */
+export async function getPoolRecordsBatch(
+  addresses: string[],
+  chain: ChainId
+): Promise<Map<string, PoolInfo>> {
+  const out = new Map<string, PoolInfo>();
+  if (addresses.length === 0) return out;
+  const lowered = [...new Set(addresses.map((a) => a.toLowerCase()))];
+  // PG 单 IN list 上限 ~32k，分块保险
+  const CHUNK = 5000;
+  for (let i = 0; i < lowered.length; i += CHUNK) {
+    const slice = lowered.slice(i, i + CHUNK);
+    const res = await getPool().query<PoolInfo>(
+      `SELECT address, chain, dex, token0, token1, fee_tier AS "feeTier"
+       FROM pools WHERE chain = $1 AND address = ANY($2::text[])`,
+      [chain, slice]
+    );
+    for (const row of res.rows) out.set(row.address.toLowerCase(), row);
+  }
+  return out;
+}
+
+/**
+ * 批量查 V4 pool 元信息。返回 Map<pool_id, V4PoolTokenInfo>。
+ */
+export async function getV4PoolsBatch(
+  poolIds: string[],
+  chain: ChainId
+): Promise<Map<string, V4PoolTokenInfo>> {
+  const out = new Map<string, V4PoolTokenInfo>();
+  if (poolIds.length === 0) return out;
+  const unique = [...new Set(poolIds)];
+  const CHUNK = 5000;
+  for (let i = 0; i < unique.length; i += CHUNK) {
+    const slice = unique.slice(i, i + CHUNK);
+    const res = await getPool().query<{
+      pool_id: string;
+      currency0: string;
+      currency1: string;
+      fee: number;
+      tickSpacing: number;
+      hooks: string;
+    }>(
+      `SELECT pool_id, currency0, currency1, fee, tick_spacing AS "tickSpacing", hooks
+       FROM v4_pools WHERE chain = $1 AND pool_id = ANY($2::text[])`,
+      [chain, slice]
+    );
+    for (const row of res.rows) {
+      out.set(row.pool_id, {
+        currency0: row.currency0,
+        currency1: row.currency1,
+        fee: row.fee,
+        tickSpacing: row.tickSpacing,
+        hooks: row.hooks,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * 批量 UPSERT pools。替代 prefetch 阶段 N 次 upsertPool 单条 INSERT。
+ */
+export async function bulkUpsertPools(pools: PoolInfo[]): Promise<void> {
+  if (pools.length === 0) return;
+  const CHUNK = 1000;
+  for (let i = 0; i < pools.length; i += CHUNK) {
+    const slice = pools.slice(i, i + CHUNK);
+    const params: unknown[] = [];
+    const placeholders: string[] = [];
+    for (const p of slice) {
+      const base = params.length;
+      placeholders.push(
+        `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},$${base + 6})`
+      );
+      params.push(p.address, p.chain, p.dex, p.token0, p.token1, p.feeTier);
+    }
+    await getPool().query(
+      `INSERT INTO pools (address, chain, dex, token0, token1, fee_tier)
+       VALUES ${placeholders.join(",")}
+       ON CONFLICT (address, chain) DO UPDATE SET
+         dex = EXCLUDED.dex,
+         token0 = EXCLUDED.token0,
+         token1 = EXCLUDED.token1,
+         fee_tier = EXCLUDED.fee_tier`,
+      params
+    );
+  }
+}
+
+/**
+ * 批量 UPSERT v4_pools。替代 prefetch 阶段 N 次 upsertV4Pool 单条 INSERT。
+ */
+export async function bulkUpsertV4Pools(
+  rows: Array<{ poolId: string; chain: ChainId; info: V4PoolTokenInfo }>
+): Promise<void> {
+  if (rows.length === 0) return;
+  const CHUNK = 1000;
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    const slice = rows.slice(i, i + CHUNK);
+    const params: unknown[] = [];
+    const placeholders: string[] = [];
+    for (const r of slice) {
+      const base = params.length;
+      placeholders.push(
+        `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},$${base + 6},$${base + 7})`
+      );
+      params.push(
+        r.poolId,
+        r.chain,
+        r.info.currency0,
+        r.info.currency1,
+        r.info.fee,
+        r.info.tickSpacing,
+        r.info.hooks
+      );
+    }
+    await getPool().query(
+      `INSERT INTO v4_pools (pool_id, chain, currency0, currency1, fee, tick_spacing, hooks)
+       VALUES ${placeholders.join(",")}
+       ON CONFLICT (pool_id, chain) DO UPDATE SET
+         currency0 = EXCLUDED.currency0,
+         currency1 = EXCLUDED.currency1,
+         fee = EXCLUDED.fee,
+         tick_spacing = EXCLUDED.tick_spacing,
+         hooks = EXCLUDED.hooks`,
+      params
+    );
+  }
+}
+
 // ============================================================================
 // 1-minute bucket aggregation (pool-level)
 // ============================================================================

@@ -17,6 +17,10 @@ import {
   upsertV4Pool,
   getPoolRecord,
   getV4Pool,
+  getPoolRecordsBatch,
+  getV4PoolsBatch,
+  bulkUpsertPools,
+  bulkUpsertV4Pools,
   upsertPool1minStat,
   upsertToken1minStat,
   bufferAddSwap,
@@ -220,12 +224,11 @@ export async function prefetchV3PoolInfo(
   });
   if (newAddrs.length === 0) return;
 
-  // DB 批量查
-  const dbPools = await Promise.all(newAddrs.map((addr) => getPoolRecord(addr, chain).catch(() => null)));
+  // 单 SQL 批量查（替代 N+1 SELECT）—— PG round-trip 从 N 次降到 1 次。
+  const dbMap = await getPoolRecordsBatch(newAddrs, chain).catch(() => new Map());
   const stillMissing: string[] = [];
-  for (let i = 0; i < newAddrs.length; i++) {
-    const dbPool = dbPools[i];
-    const addr = newAddrs[i];
+  for (const addr of newAddrs) {
+    const dbPool = dbMap.get(addr);
     if (dbPool) {
       poolInfoCache.set(`${chain}:${addr}`, {
         token0: dbPool.token0,
@@ -257,7 +260,8 @@ export async function prefetchV3PoolInfo(
     return;
   }
 
-  const upserts: Promise<void>[] = [];
+  // 收集成 batch UPSERT，替代 N 次单条 INSERT。
+  const upsertRows: import("../types/index.js").PoolInfo[] = [];
   for (let i = 0; i < stillMissing.length; i++) {
     const addr = stillMissing[i];
     const r0 = results[i * 3];
@@ -276,11 +280,9 @@ export async function prefetchV3PoolInfo(
       feeTier: Number(r2.result),
     };
     poolInfoCache.set(`${chain}:${addr}`, info);
-    upserts.push(
-      upsertPool({ address: addr, chain, dex, token0: info.token0, token1: info.token1, feeTier: info.feeTier })
-    );
+    upsertRows.push({ address: addr, chain, dex, token0: info.token0, token1: info.token1, feeTier: info.feeTier });
   }
-  await Promise.all(upserts);
+  await bulkUpsertPools(upsertRows);
 }
 
 /** 批量 prefetch UniV4 pool info（同 PancakeV4 CL，但用 UniV4 PositionManager） */
@@ -296,11 +298,10 @@ export async function prefetchV4PoolInfo(
   });
   if (newIds.length === 0) return;
 
-  const dbPools = await Promise.all(newIds.map((id) => getV4Pool(id, chain).catch(() => null)));
+  const dbMap = await getV4PoolsBatch(newIds, chain).catch(() => new Map());
   const stillMissing: string[] = [];
-  for (let i = 0; i < newIds.length; i++) {
-    const dbPool = dbPools[i];
-    const id = newIds[i];
+  for (const id of newIds) {
+    const dbPool = dbMap.get(id);
     if (dbPool) {
       v4PoolInfoCache.set(`${chain}:${id}`, dbPool);
     } else {
@@ -330,7 +331,7 @@ export async function prefetchV4PoolInfo(
   }
 
   const ZERO = "0x0000000000000000000000000000000000000000";
-  const upserts: Promise<void>[] = [];
+  const upsertRows: Array<{ poolId: string; chain: ChainId; info: V4PoolTokenInfo }> = [];
   for (let i = 0; i < stillMissing.length; i++) {
     const id = stillMissing[i];
     const r = results[i];
@@ -352,9 +353,9 @@ export async function prefetchV4PoolInfo(
       hooks,
     };
     v4PoolInfoCache.set(`${chain}:${id}`, info);
-    upserts.push(upsertV4Pool(id, chain, info));
+    upsertRows.push({ poolId: id, chain, info });
   }
-  await Promise.all(upserts);
+  await bulkUpsertV4Pools(upsertRows);
 }
 
 function parseint256(hex: string): bigint {
@@ -759,14 +760,12 @@ export async function prefetchPcsV4ClPoolInfo(
   });
   if (newIds.length === 0) return;
 
-  // 先 batch DB lookup（之前 backfill 跑过的池子已落 v4_pools）
-  const dbPools = await Promise.all(
-    newIds.map((id) => getV4Pool(`pcsv4cl:${id}`, chain).catch(() => null))
-  );
+  // 单 SQL 批量查（v4_pools 表的 pcsv4cl 加 prefix namespace）
+  const prefixedIds = newIds.map((id) => `pcsv4cl:${id}`);
+  const dbMap = await getV4PoolsBatch(prefixedIds, chain).catch(() => new Map());
   const stillMissing: string[] = [];
-  for (let i = 0; i < newIds.length; i++) {
-    const dbPool = dbPools[i];
-    const id = newIds[i];
+  for (const id of newIds) {
+    const dbPool = dbMap.get(`pcsv4cl:${id}`);
     if (dbPool) {
       pcsV4PoolInfoCache.set(`pcsv4cl:${chain}:${id}`, dbPool);
     } else {
@@ -798,7 +797,7 @@ export async function prefetchPcsV4ClPoolInfo(
   }
 
   const ZERO = "0x0000000000000000000000000000000000000000";
-  const upserts: Promise<void>[] = [];
+  const upsertRows: Array<{ poolId: string; chain: ChainId; info: V4PoolTokenInfo }> = [];
   for (let i = 0; i < stillMissing.length; i++) {
     const id = stillMissing[i];
     const cacheKey = `pcsv4cl:${chain}:${id}`;
@@ -821,9 +820,9 @@ export async function prefetchPcsV4ClPoolInfo(
       hooks,
     };
     pcsV4PoolInfoCache.set(cacheKey, info);
-    upserts.push(upsertV4Pool(`pcsv4cl:${id}`, chain, info));
+    upsertRows.push({ poolId: `pcsv4cl:${id}`, chain, info });
   }
-  await Promise.all(upserts);
+  await bulkUpsertV4Pools(upsertRows);
 }
 
 /** PancakeV4 CL Swap log data: amount0(int128) | amount1(int128) | sqrtPriceX96(uint160)
