@@ -74,6 +74,9 @@ const HTTP_URL = process.env.BF_RPC_URL || process.env.BSC_HTTP_URL || "http://1
 const FROM_BLOCK_OVERRIDE = process.env.BF_FROM_BLOCK ? BigInt(process.env.BF_FROM_BLOCK) : null;
 const TO_BLOCK_OVERRIDE = process.env.BF_TO_BLOCK ? BigInt(process.env.BF_TO_BLOCK) : null;
 const SKIP_REBUILD = process.env.BF_SKIP_REBUILD === "1";
+// 双 shard 跑时必须设 BF_SKIP_MIGRATE=1：避免一个 shard 先跑完触发 migrate（含 TRUNCATE staging），
+// 把另一个 shard 还在写的 staging 数据清掉。所有 shard 跑完后手动 migrate。
+const SKIP_MIGRATE = process.env.BF_SKIP_MIGRATE === "1";
 const SHARD_LABEL = process.env.BF_SHARD_LABEL || "main";
 
 // Staging 模式：fetcher 写到无索引 staging 表，跑完 migrate 到 swaps。
@@ -338,7 +341,7 @@ async function discoverV4Pools(
   toBlock: bigint,
   targetTokens: Set<string>,
   baseTokens: Set<string>
-): Promise<void> {
+): Promise<{ v4Ids: `0x${string}`[]; pcsV4ClIds: `0x${string}`[] }> {
   const fromBlock = V4_BSC_DEPLOY_BLOCK;
   const v4PoolManager = CONTRACTS.bsc.uniswapV4PoolManager as `0x${string}`;
   const pcsV4ClPoolManager = CONTRACTS.bsc.pancakeswapV4ClPoolManager as `0x${string}`;
@@ -426,11 +429,90 @@ async function discoverV4Pools(
 
   if (dedup.length > 0) await bulkUpsertV4Pools(dedup);
 
-  const v4Count = dedup.filter((r) => !r.poolId.startsWith("pcsv4cl:")).length;
-  const pcsCount = dedup.filter((r) => r.poolId.startsWith("pcsv4cl:")).length;
-  console.log(
-    `[Discover V4] 完成 ${((Date.now() - t0) / 1000).toFixed(0)}s — V4=${v4Count} 池, PCS V4 CL=${pcsCount} 池`
+  // 从 PG 拿 union 全集（dump ∪ scan），返回 poolIds 给 swap getLogs args.id 过滤
+  const v4Res = await getPool().query<{ pool_id: string }>(
+    `SELECT pool_id FROM v4_pools WHERE chain='bsc' AND pool_id NOT LIKE 'pcsv4cl:%'`
   );
+  const pcsRes = await getPool().query<{ pool_id: string }>(
+    `SELECT pool_id FROM v4_pools WHERE chain='bsc' AND pool_id LIKE 'pcsv4cl:%'`
+  );
+  const v4Ids = v4Res.rows.map((r) => r.pool_id as `0x${string}`);
+  const pcsV4ClIds = pcsRes.rows.map(
+    (r) => r.pool_id.replace(/^pcsv4cl:/, "") as `0x${string}`
+  );
+
+  console.log(
+    `[Discover V4] 完成 ${((Date.now() - t0) / 1000).toFixed(0)}s — V4=${v4Ids.length} 池, PCS V4 CL=${pcsV4ClIds.length} 池`
+  );
+  return { v4Ids, pcsV4ClIds };
+}
+
+/**
+ * V4 swap getLogs 拆 chunk + topic filter（args.id）。
+ * 节点上限 1000 topic，超了节点 reject "Invalid parameters"。
+ * V4 ~21k 池子 + PCS V4 CL ~8k 池子 → 必须拆。
+ *
+ * 收益：避免全链拉 V4 swap（90d 早期可能 30k+ logs/batch），节点端只返回白名单 swap，
+ * 后续 prefetch / process / flush 都只处理白名单数据，整体 ETA 下降。
+ *
+ * 单 worker 内 chunks 限 4 并发：避免与同 batch 的 V3/PCS V3/BNB getLogs + 多 fetcher worker
+ * 一起把节点打爆。8 fetcher × 4 chunk = 32 V4 RPC concurrent + 5 其他 = 37 system concurrent。
+ */
+const TOPIC_FILTER_CHUNK_SIZE = 1000;
+const V4_CHUNK_CONCURRENCY = 4;
+
+async function getLogsV4Chunked(
+  managerAddr: `0x${string}`,
+  poolIds: `0x${string}`[],
+  fromBlock: bigint,
+  toBlock: bigint,
+  event: ReturnType<typeof parseAbiItem>
+): Promise<Log[]> {
+  if (poolIds.length === 0) {
+    // 没池子（比如 PCS V4 CL dump=0 + scan=0 极端情况）→ 全链拉，process 阶段过滤
+    return (await httpClient.getLogs({
+      address: managerAddr,
+      fromBlock,
+      toBlock,
+      // @ts-expect-error event union
+      event,
+    })) as unknown as Log[];
+  }
+  if (poolIds.length <= TOPIC_FILTER_CHUNK_SIZE) {
+    return (await httpClient.getLogs({
+      address: managerAddr,
+      fromBlock,
+      toBlock,
+      // @ts-expect-error event union
+      event,
+      args: { id: poolIds },
+    })) as unknown as Log[];
+  }
+  const chunks: `0x${string}`[][] = [];
+  for (let i = 0; i < poolIds.length; i += TOPIC_FILTER_CHUNK_SIZE) {
+    chunks.push(poolIds.slice(i, i + TOPIC_FILTER_CHUNK_SIZE));
+  }
+  const results: Log[][] = [];
+  let cursor = 0;
+  async function chunkWorker() {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= chunks.length) break;
+      const logs = (await httpClient.getLogs({
+        address: managerAddr,
+        fromBlock,
+        toBlock,
+        // @ts-expect-error event union
+        event,
+        args: { id: chunks[idx] },
+      })) as unknown as Log[];
+      results.push(logs);
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(V4_CHUNK_CONCURRENCY, chunks.length) }, chunkWorker)
+  );
+  return results.flat();
 }
 
 /**
@@ -444,6 +526,8 @@ async function fetchAndProcessBatch(
   bnbPricePool: `0x${string}`,
   v3PoolList: `0x${string}`[],
   pcsV3PoolList: `0x${string}`[],
+  v4PoolIds: `0x${string}`[],
+  pcsV4ClPoolIds: `0x${string}`[],
   timing: BatchTiming
 ): Promise<{ buffer: BatchBuffer; logs: number; processed: number; errors: number }> {
   const { from, to } = job;
@@ -458,25 +542,17 @@ async function fetchAndProcessBatch(
   let bnbV2: Log[] = [];
   try {
     // getBlock + 5 个 getLogs 全部并发 in-flight（不再分两步）→ 节点真并行处理。
-    // V3/PCS V3 加 address: [...whitelistedPools] 让节点直接过滤，
-    // 数据量从全链 ~30k logs → 仅白名单池子 ~1k logs，fetch 时长腰斩。
+    // V3/PCS V3：address: [...whitelistedPools] 让节点直接过滤
+    // V4/PCS V4 CL：PoolManager singleton，不能 address filter，但 swap event `id` 是 indexed
+    //   topic filter 节点上限 1000，所以拆 chunk + 内部 4 并发跑（getLogsV4Chunked）
+    //   收益：节点端只返回白名单 swap，prefetch / process / flush 都受益
     const [fb, tb, l1, l2, l3, l4, l5] = await Promise.all([
       httpClient.getBlock({ blockNumber: from }),
       httpClient.getBlock({ blockNumber: to }),
       httpClient.getLogs({ address: v3PoolList, fromBlock: from, toBlock: to, event: V3_SWAP }) as unknown as Promise<Log[]>,
       httpClient.getLogs({ address: pcsV3PoolList, fromBlock: from, toBlock: to, event: PANCAKE_V3_SWAP }) as unknown as Promise<Log[]>,
-      httpClient.getLogs({
-        address: v4PoolManager,
-        fromBlock: from,
-        toBlock: to,
-        event: V4_SWAP,
-      }) as unknown as Promise<Log[]>,
-      httpClient.getLogs({
-        address: pcsV4ClPoolManager,
-        fromBlock: from,
-        toBlock: to,
-        event: PCS_V4_CL_SWAP,
-      }) as unknown as Promise<Log[]>,
+      getLogsV4Chunked(v4PoolManager, v4PoolIds, from, to, V4_SWAP),
+      getLogsV4Chunked(pcsV4ClPoolManager, pcsV4ClPoolIds, from, to, PCS_V4_CL_SWAP),
       httpClient.getLogs({
         address: bnbPricePool,
         fromBlock: from,
@@ -648,6 +724,8 @@ async function main() {
   // BF_SKIP_DISCOVERY=1 跳过（仅 V4 单跑或调试用）
   let v3PoolList: `0x${string}`[] = [];
   let pcsV3PoolList: `0x${string}`[] = [];
+  let v4PoolIds: `0x${string}`[] = [];
+  let pcsV4ClPoolIds: `0x${string}`[] = [];
   if (process.env.BF_SKIP_DISCOVERY !== "1") {
     const tokens = await getAllBinanceBscTokens();
     // 拆 target / base：
@@ -664,8 +742,10 @@ async function main() {
     v3PoolList = discovered.v3;
     pcsV3PoolList = discovered.pcsV3;
 
-    // V4 / PCS V4 CL discovery（pre-fill v4_pools 表，让主循环 prefetch 全 cache hit）
-    await discoverV4Pools(end, targetTokens, baseTokens);
+    // V4 / PCS V4 CL discovery：pre-fill v4_pools 表 + 拿 poolIds 给 swap getLogs topic filter
+    const v4Discovered = await discoverV4Pools(end, targetTokens, baseTokens);
+    v4PoolIds = v4Discovered.v4Ids;
+    pcsV4ClPoolIds = v4Discovered.pcsV4ClIds;
   } else {
     console.log(`[Backfill][${SHARD_LABEL}] BF_SKIP_DISCOVERY=1, V3/PCS V3 走全链扫描 + V4 走链上 multicall（慢）`);
   }
@@ -700,7 +780,7 @@ async function main() {
         await new Promise((r) => setTimeout(r, 50));
       }
       try {
-        const r = await fetchAndProcessBatch(job, v4PoolManager, pcsV4ClPoolManager, bnbPricePool, v3PoolList, pcsV3PoolList, timing);
+        const r = await fetchAndProcessBatch(job, v4PoolManager, pcsV4ClPoolManager, bnbPricePool, v3PoolList, pcsV3PoolList, v4PoolIds, pcsV4ClPoolIds, timing);
         totalLogs += r.logs;
         totalProcessed += r.processed;
         totalErrors += r.errors;
@@ -766,7 +846,10 @@ async function main() {
   );
 
   // Staging 模式：把 staging 数据 migrate 到 swaps（hash semi-join 比逐行 ON CONFLICT 快）
-  if (USE_STAGING) {
+  // 双 shard 跑时设 BF_SKIP_MIGRATE=1 跳过，所有 shard 跑完后单独 migrate。
+  if (USE_STAGING && SKIP_MIGRATE) {
+    console.log(`[Backfill][${SHARD_LABEL}] skip migrate (BF_SKIP_MIGRATE=1)；所有 shard 跑完后手动 migrate`);
+  } else if (USE_STAGING) {
     console.log(`[Backfill][${SHARD_LABEL}] migrating staging → swaps（这步可能 1-2h，PG hash semi-join）`);
     const migT0 = Date.now();
     const r = await migrateStagingToSwaps();
