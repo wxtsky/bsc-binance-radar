@@ -48,9 +48,8 @@ function parseDuration(s: string | undefined): number {
 
 const HOURS = parseDuration(process.argv[2]);
 const CONCURRENCY = Number(process.argv[3]) || 6;
-// 大 batch 减少 RPC 次数（节点 90d 前 logs 多，1000 blocks ≈ 30k logs/batch；
-// 2000 blocks ≈ 60k logs/batch，单 getLogs 仍 < 10MB JSON 节点扛得住）
-const BLOCKS_PER_BATCH = BigInt(Number(process.env.BF_BATCH_SIZE) || 2000);
+// 默认 1000 blocks/batch（30d 测过最稳）。BF_BATCH_SIZE 可覆盖。
+const BLOCKS_PER_BATCH = BigInt(Number(process.env.BF_BATCH_SIZE) || 1000);
 
 const HTTP_URL = process.env.BSC_HTTP_URL || "http://151.123.172.62:81";
 
