@@ -1,0 +1,85 @@
+[package]
+name = "bsc-binance-radar"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+
+[dependencies]
+# async runtime
+tokio = { version = "1.40", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# EVM RPC + ABI（alloy 比 ethers-rs 新，性能更好）
+alloy = { version = "0.8", features = [
+  "full",
+  "rpc-types",
+  "providers",
+  "transports",
+  "transport-http",
+  "transport-ws",
+  "rpc-types-eth",
+  "sol-types",
+  "json-abi",
+  "node-bindings",
+  "consensus",
+  "network",
+] }
+
+# PG（tokio-postgres + deadpool 池 + binary COPY）
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+deadpool-postgres = "0.14"
+postgres-types = { version = "0.2", features = ["derive"] }
+postgres-protocol = "0.6"
+
+# serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# error
+anyhow = "1"
+thiserror = "1"
+
+# log
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# env / config
+dotenvy = "0.15"
+
+# time
+chrono = { version = "0.4", features = ["serde"] }
+
+# HTTP（OKX / 飞书 webhook / GitHub seed）
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# misc
+hex = "0.4"
+once_cell = "1.19"
+url = "2.5"
+parking_lot = "0.12"
+
+[[bin]]
+name = "backfill"
+path = "src/bin/backfill.rs"
+
+[[bin]]
+name = "radar"
+path = "src/bin/radar.rs"
+
+[[bin]]
+name = "verify-factories"
+path = "src/bin/verify_factories.rs"
+
+[[bin]]
+name = "enrich-bsc-mapping"
+path = "src/bin/enrich_bsc_mapping.rs"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = true

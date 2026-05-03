@@ -1,10 +1,38 @@
-node_modules
-dist
-data
-.git
+# Rust build artifacts
+target/
+
+# Archived TS code（不再使用）
+archive-ts/
+
+# Node 残留
+node_modules/
+dist/
+bun.lock
+package.json
+tsconfig.json
+
+# Test/data files
+backtest-*.json
+launch-tops-*.json
+
+# Logs
+*.log
+backups/
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
+
+# Git
+.git/
+.gitignore
+
+# Env
 .env
 .env.local
-.DS_Store
-*.log
+.env.example
+
+# Docs
 README.md
 HANDOFF.md

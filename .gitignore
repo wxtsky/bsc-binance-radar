@@ -10,3 +10,11 @@ launch-tops-analysis.json
 backups/
 .claude/
 .gitignore.new
+
+# Rust build artifacts
+target/
+Cargo.lock.bak
+
+# 旧 TS 残留
+archive-ts/node_modules/
+archive-ts/dist/
