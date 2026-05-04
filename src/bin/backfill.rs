@@ -18,20 +18,20 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
-use bsc_binance_radar::abis::{PancakeV3Swap, PcsV4ClSwap, V2Swap, V3Swap, V4Swap};
+use bsc_binance_radar::abis::{PancakeV3Swap, PcsV4ClSwap, V3Swap, V4Swap};
 use bsc_binance_radar::clients::bsc::{
     build_http_client, default_http_url, discovery_http_url,
 };
 use bsc_binance_radar::contracts::BscContracts;
 use bsc_binance_radar::db::queries::{
-    bulk_insert_bnb_prices, bulk_insert_swaps_staging, create_staging_table,
+    bulk_insert_bnb_prices, bulk_insert_swaps_staging, create_staging_table, load_main_pool_cache,
     migrate_staging_to_swaps, rebuild_buckets_from_swaps, select_all_binance_bsc_tokens,
 };
 use bsc_binance_radar::db::{ensure_schema, init_pool};
-use bsc_binance_radar::discovery::{discover_v4_pools, discover_whitelisted_pools};
+use bsc_binance_radar::abis::V2Swap;
 use bsc_binance_radar::swap_processor::{
-    interpolate_log_ts, process_pcs_v4_cl_swap, process_v2_bnb_swap, process_v3_swap,
-    process_v4_swap, BnbPriceCache, PoolMeta,
+    interpolate_log_ts, process_pcs_v4_cl_swap, process_v2_swap, process_v3_bnb_swap,
+    process_v3_swap, process_v4_swap, BnbPriceCache, PoolMeta,
 };
 use bsc_binance_radar::token_tracker::{init_watchlist, watchlist_addresses};
 use bsc_binance_radar::types::{BnbPricePoint, DexType, SwapRecord};
@@ -91,47 +91,39 @@ struct Timing {
 struct PoolCache {
     v3: HashMap<Address, PoolMeta>,
     pcs_v3: HashMap<Address, PoolMeta>,
+    v2: HashMap<Address, PoolMeta>,
     v4: HashMap<B256, PoolMeta>,
     pcs_v4_cl: HashMap<B256, PoolMeta>,
 }
 
+/// 新策略：从 main_pools 表加载（每 token 一个主池），按 dex 分桶
 async fn load_pool_cache() -> Result<PoolCache> {
-    let v3_raw = bsc_binance_radar::db::queries::load_v3_pool_cache(
-        bsc_binance_radar::types::CHAIN_BSC, DexType::UniswapV3
-    ).await?;
-    let pcs_v3_raw = bsc_binance_radar::db::queries::load_v3_pool_cache(
-        bsc_binance_radar::types::CHAIN_BSC, DexType::PancakeswapV3
-    ).await?;
-    let v4_raw = bsc_binance_radar::db::queries::load_v4_pool_cache(
-        bsc_binance_radar::types::CHAIN_BSC, DexType::UniswapV4
-    ).await?;
-    let pcs_v4_raw = bsc_binance_radar::db::queries::load_v4_pool_cache(
-        bsc_binance_radar::types::CHAIN_BSC, DexType::PancakeswapV4Cl
-    ).await?;
-
-    let v3: HashMap<Address, PoolMeta> = v3_raw.into_iter().map(|(addr, (t0, t1, fee))| {
-        (addr, PoolMeta { token0: t0, token1: t1, fee_tier: fee })
-    }).collect();
-    let pcs_v3: HashMap<Address, PoolMeta> = pcs_v3_raw.into_iter().map(|(addr, (t0, t1, fee))| {
-        (addr, PoolMeta { token0: t0, token1: t1, fee_tier: fee })
-    }).collect();
-    let v4: HashMap<B256, PoolMeta> = v4_raw.into_iter().map(|(id, (c0, c1, fee))| {
-        (id, PoolMeta { token0: c0, token1: c1, fee_tier: fee })
-    }).collect();
-    let pcs_v4_cl: HashMap<B256, PoolMeta> = pcs_v4_raw.into_iter().map(|(id, (c0, c1, fee))| {
-        (id, PoolMeta { token0: c0, token1: c1, fee_tier: fee })
-    }).collect();
+    let raw = load_main_pool_cache().await?;
+    let to_meta = |raw: HashMap<Address, (Address, Address, u32)>| -> HashMap<Address, PoolMeta> {
+        raw.into_iter().map(|(addr, (t0, t1, fee))| {
+            (addr, PoolMeta { token0: t0, token1: t1, fee_tier: fee })
+        }).collect()
+    };
+    let to_meta_b256 = |raw: HashMap<B256, (Address, Address, u32)>| -> HashMap<B256, PoolMeta> {
+        raw.into_iter().map(|(id, (c0, c1, fee))| {
+            (id, PoolMeta { token0: c0, token1: c1, fee_tier: fee })
+        }).collect()
+    };
+    let v3 = to_meta(raw.v3);
+    let pcs_v3 = to_meta(raw.pcs_v3);
+    let v2 = to_meta(raw.v2);
+    let v4 = to_meta_b256(raw.v4);
+    let pcs_v4_cl = to_meta_b256(raw.pcs_v4_cl);
 
     info!(
-        "[PoolCache] preloaded V3={} PCS V3={} V4={} PCS V4 CL={}",
-        v3.len(), pcs_v3.len(), v4.len(), pcs_v4_cl.len()
+        "[PoolCache] from main_pools: V3={} PCS V3={} V2={} V4={} PCS V4 CL={}",
+        v3.len(), pcs_v3.len(), v2.len(), v4.len(), pcs_v4_cl.len()
     );
-    Ok(PoolCache { v3, pcs_v3, v4, pcs_v4_cl })
+    Ok(PoolCache { v3, pcs_v3, v2, v4, pcs_v4_cl })
 }
 
 async fn detect_bnb_price_token0() -> bool {
-    // 简化：BNB price pool 是 PancakeV2 WBNB/USDT，假设 token1=WBNB（实测从池子静态数据拿到）
-    // PancakeV2 0x16b9a82891338f9bA80E2D6970FddA79D1eb0daE: token0=USDT, token1=WBNB
+    // PCS V3 0x172fcD41E0913e95784454622d1c3724f546f849: token0=USDT, token1=WBNB
     false
 }
 
@@ -153,10 +145,12 @@ async fn fetch_one_batch(
     let pcs_v3_swap_sig = PancakeV3Swap::SIGNATURE_HASH;
     let v4_swap_sig = V4Swap::SIGNATURE_HASH;
     let pcs_v4_cl_swap_sig = PcsV4ClSwap::SIGNATURE_HASH;
-    let v2_swap_sig = V2Swap::SIGNATURE_HASH;
+    // BNB price 池切 V3，监听 PCS V3 Swap event
+    let bnb_price_sig = PancakeV3Swap::SIGNATURE_HASH;
 
     let v3_addrs: Vec<Address> = pool_cache.v3.keys().copied().collect();
     let pcs_v3_addrs: Vec<Address> = pool_cache.pcs_v3.keys().copied().collect();
+    let v2_addrs: Vec<Address> = pool_cache.v2.keys().copied().collect();
 
     let v4_pm = BscContracts::UNISWAP_V4_POOL_MANAGER;
     let pcs_v4_cl_pm = BscContracts::PANCAKESWAP_V4_CL_POOL_MANAGER;
@@ -182,11 +176,16 @@ async fn fetch_one_batch(
         .from_block(from)
         .to_block(to)
         .event_signature(pcs_v4_cl_swap_sig);
+    let filter_v2 = Filter::new()
+        .address(v2_addrs)
+        .from_block(from)
+        .to_block(to)
+        .event_signature(V2Swap::SIGNATURE_HASH);
     let filter_bnb = Filter::new()
         .address(bnb_pool)
         .from_block(from)
         .to_block(to)
-        .event_signature(v2_swap_sig);
+        .event_signature(bnb_price_sig);
 
     let f_block_from = client.get_block_by_number(from.into(), alloy::rpc::types::BlockTransactionsKind::Hashes);
     let f_block_to = client.get_block_by_number(to.into(), alloy::rpc::types::BlockTransactionsKind::Hashes);
@@ -194,10 +193,11 @@ async fn fetch_one_batch(
     let f_pcs_v3 = client.get_logs(&filter_pcs_v3);
     let f_v4 = client.get_logs(&filter_v4);
     let f_pcs_v4 = client.get_logs(&filter_pcs_v4);
+    let f_v2 = client.get_logs(&filter_v2);
     let f_bnb = client.get_logs(&filter_bnb);
 
-    let (block_from, block_to, v3_logs, pcs_v3_logs, v4_logs, pcs_v4_logs, bnb_logs) =
-        tokio::try_join!(f_block_from, f_block_to, f_v3, f_pcs_v3, f_v4, f_pcs_v4, f_bnb)?;
+    let (block_from, block_to, v3_logs, pcs_v3_logs, v4_logs, pcs_v4_logs, v2_logs, bnb_logs) =
+        tokio::try_join!(f_block_from, f_block_to, f_v3, f_pcs_v3, f_v4, f_pcs_v4, f_v2, f_bnb)?;
 
     timing.fetch_ms.fetch_add(fetch_t0.elapsed().as_millis() as u64, Ordering::Relaxed);
 
@@ -212,9 +212,10 @@ async fn fetch_one_batch(
     let mut buffer = BatchBuffer::default();
 
     // BNB price logs first（更新 cache 给后续 USD 计算用）
+    // V3 池：用 sqrtPriceX96 算 spot price，无成交滑点干扰
     for log in bnb_logs {
         let ts = interpolate_log_ts(&log, from, to, from_ts_ms, to_ts_ms);
-        match process_v2_bnb_swap(&log, ts, bnb_pool_wbnb_is_token0) {
+        match process_v3_bnb_swap(&log, ts, bnb_pool_wbnb_is_token0) {
             Ok((point, price)) => {
                 bnb_cache.set(price);
                 buffer.bnb_prices.push(point);
@@ -287,6 +288,20 @@ async fn fetch_one_batch(
         }
     }
 
+    // PCS V2（通用主池监控，新增）
+    for log in v2_logs {
+        let pool_addr = log.address();
+        let meta = match pool_cache.v2.get(&pool_addr) {
+            Some(m) => m,
+            None => continue,
+        };
+        let ts = interpolate_log_ts(&log, from, to, from_ts_ms, to_ts_ms);
+        match process_v2_swap(&log, bsc_binance_radar::types::CHAIN_BSC, meta, pool_addr, ts, bnb_now) {
+            Ok(rec) => buffer.swaps.push(rec),
+            Err(e) => warn!("V2 process fail: {}", e),
+        }
+    }
+
     timing.process_ms.fetch_add(process_t0.elapsed().as_millis() as u64, Ordering::Relaxed);
     Ok(buffer)
 }
@@ -325,7 +340,6 @@ async fn main() -> Result<()> {
     let to_block_override: Option<u64> = std::env::var("BF_TO_BLOCK").ok().and_then(|s| s.parse().ok());
     let skip_rebuild = std::env::var("BF_SKIP_REBUILD").map(|s| s == "1").unwrap_or(false);
     let skip_migrate = std::env::var("BF_SKIP_MIGRATE").map(|s| s == "1").unwrap_or(false);
-    let skip_discovery = std::env::var("BF_SKIP_DISCOVERY").map(|s| s == "1").unwrap_or(false);
     let shard_label = std::env::var("BF_SHARD_LABEL").unwrap_or_else(|_| "main".to_string());
 
     let http_url = default_http_url();
@@ -340,11 +354,11 @@ async fn main() -> Result<()> {
     ensure_schema().await?;
     init_watchlist().await?;
 
-    let target_tokens = watchlist_addresses();
+    let _target_tokens = watchlist_addresses();
     let _ = select_all_binance_bsc_tokens().await?; // 验证 PG 连接
 
     let http_client = Arc::new(build_http_client(&http_url)?);
-    let discovery_client = Arc::new(build_http_client(&discovery_url)?);
+    let _discovery_client = Arc::new(build_http_client(&discovery_url)?);
 
     let latest = http_client.get_block_number().await?;
     let block_time_secs = 0.45_f64; // BSC 已升级到 ~0.45s/block
@@ -364,14 +378,8 @@ async fn main() -> Result<()> {
         shard_label
     );
 
-    if !skip_discovery {
-        info!("[Backfill][{}] 白名单 target={}", shard_label, target_tokens.len());
-        let _ = discover_whitelisted_pools(discovery_client.clone(), end, target_tokens.clone()).await?;
-        let _ = discover_v4_pools(discovery_client.clone(), end, target_tokens.clone()).await?;
-    } else {
-        info!("[Backfill][{}] BF_SKIP_DISCOVERY=1，跳过 discovery", shard_label);
-    }
-
+    // 新策略：discovery 已废，直接从 main_pools 表加载主池（每 token 一行，TVL 最大池）
+    info!("[Backfill][{}] 加载 main_pools（新策略：每 token 1 主池）", shard_label);
     let pool_cache = Arc::new(load_pool_cache().await?);
     let bnb_cache = Arc::new(BnbPriceCache::new(600.0)); // 启动 placeholder，会被实时 V2 swap 更新
     let bnb_pool_wbnb_is_token0 = detect_bnb_price_token0().await;

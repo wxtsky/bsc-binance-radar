@@ -6,6 +6,7 @@ pub type ChainId = i16; // SMALLINT
 pub const CHAIN_BSC: i16 = 1;
 
 /// dex 枚举（跟 db/init.sql 对应）
+/// 5 = pancakeswap-v2（通用，36 个主池监控；BNB price 已切 PCS V3 0.01% 池走 dex=2）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(i16)]
 pub enum DexType {
@@ -13,7 +14,7 @@ pub enum DexType {
     PancakeswapV3 = 2,
     UniswapV4 = 3,
     PancakeswapV4Cl = 4,
-    PancakeswapV2BnbPrice = 5,
+    PancakeswapV2 = 5,
 }
 
 impl DexType {
@@ -27,7 +28,7 @@ impl DexType {
             2 => Some(DexType::PancakeswapV3),
             3 => Some(DexType::UniswapV4),
             4 => Some(DexType::PancakeswapV4Cl),
-            5 => Some(DexType::PancakeswapV2BnbPrice),
+            5 => Some(DexType::PancakeswapV2),
             _ => None,
         }
     }
@@ -82,7 +83,7 @@ pub struct SwapRecord {
     pub block_number: i64,
 }
 
-/// BNB/USDT V2 池的价格记录（bnb_price_history 表）
+/// BNB/USDT 池的价格记录（bnb_price_history 表，新策略走 PCS V3 0.01% 池）
 #[derive(Debug, Clone)]
 pub struct BnbPricePoint {
     pub timestamp: i64,

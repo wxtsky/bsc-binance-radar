@@ -1,5 +1,5 @@
-use crate::types::{BinanceBscToken, BnbPricePoint, ChainId, DexType, PoolInfo, SwapRecord, V4PoolInfo, CHAIN_BSC};
-use alloy::primitives::{Address, B256, I256};
+use crate::types::{BinanceBscToken, BnbPricePoint, ChainId, DexType, PoolInfo, SwapRecord, V4PoolInfo};
+use alloy::primitives::{Address, B256};
 use anyhow::{Context, Result};
 use futures::pin_mut;
 use postgres_types::Type;
@@ -184,6 +184,115 @@ pub async fn select_v4_pool_ids(chain: ChainId, dex: DexType) -> Result<Vec<B256
         }
     }
     Ok(out)
+}
+
+// ============== MAIN POOLS（新策略：每 token 一个主池索引表）==============
+
+/// main_pools 一行（按 dex 分桶后给 stream/backfill）
+#[derive(Debug, Clone)]
+pub struct MainPoolRow {
+    pub coin: String,
+    pub token_addr: Address,
+    pub pool_addr: Vec<u8>,    // 20 bytes (V2/V3) 或 32 bytes (V4 poolId)
+    pub dex: DexType,
+    pub base_addr: Address,
+    pub fee_bps: i32,
+    pub is_native_bnb: bool,
+}
+
+pub async fn select_all_main_pools() -> Result<Vec<MainPoolRow>> {
+    let client = get_pool().get().await?;
+    let rows = client.query(
+        "SELECT coin, token_addr, pool_addr, dex, base_addr, COALESCE(fee_bps, 0) AS fee_bps, is_native_bnb FROM main_pools",
+        &[],
+    ).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let token_bytes: &[u8] = r.get(1);
+        let pool_bytes: &[u8] = r.get(2);
+        let dex_smallint: i16 = r.get(3);
+        let base_bytes: &[u8] = r.get(4);
+        if token_bytes.len() != 20 || base_bytes.len() != 20 {
+            continue;
+        }
+        if pool_bytes.len() != 20 && pool_bytes.len() != 32 {
+            continue;
+        }
+        let dex = match DexType::from_db_smallint(dex_smallint) {
+            Some(d) => d,
+            None => continue,
+        };
+        out.push(MainPoolRow {
+            coin: r.get(0),
+            token_addr: Address::from_slice(token_bytes),
+            pool_addr: pool_bytes.to_vec(),
+            dex,
+            base_addr: Address::from_slice(base_bytes),
+            fee_bps: r.get(5),
+            is_native_bnb: r.get(6),
+        });
+    }
+    Ok(out)
+}
+
+/// PoolCache 5 桶（按 dex 分类，给 backfill/stream 用）
+/// V2/V3: pool address (20 bytes)；V4/PCS V4 CL: pool_id (32 bytes)
+pub struct MainPoolCache {
+    pub v3: HashMap<Address, (Address, Address, u32)>,            // (token0, token1, fee_bps)
+    pub pcs_v3: HashMap<Address, (Address, Address, u32)>,
+    pub v2: HashMap<Address, (Address, Address, u32)>,
+    pub v4: HashMap<B256, (Address, Address, u32)>,
+    pub pcs_v4_cl: HashMap<B256, (Address, Address, u32)>,
+}
+
+/// 从 main_pools 表加载所有主池，按 dex 分桶
+/// 注意：token0/token1 由 (token, base) 排序得到（与链上 pool.token0/token1 一致 — 字典序）
+pub async fn load_main_pool_cache() -> Result<MainPoolCache> {
+    let rows = select_all_main_pools().await?;
+    let mut cache = MainPoolCache {
+        v3: HashMap::new(),
+        pcs_v3: HashMap::new(),
+        v2: HashMap::new(),
+        v4: HashMap::new(),
+        pcs_v4_cl: HashMap::new(),
+    };
+    for r in rows {
+        // token0 = min(token, base), token1 = max(token, base) — EVM pool 字典序
+        let (t0, t1) = if r.token_addr < r.base_addr {
+            (r.token_addr, r.base_addr)
+        } else {
+            (r.base_addr, r.token_addr)
+        };
+        let fee = r.fee_bps as u32;
+        match r.dex {
+            DexType::UniswapV3 => {
+                if r.pool_addr.len() == 20 {
+                    cache.v3.insert(Address::from_slice(&r.pool_addr), (t0, t1, fee));
+                }
+            }
+            DexType::PancakeswapV3 => {
+                if r.pool_addr.len() == 20 {
+                    cache.pcs_v3.insert(Address::from_slice(&r.pool_addr), (t0, t1, fee));
+                }
+            }
+            DexType::PancakeswapV2 => {
+                if r.pool_addr.len() == 20 {
+                    cache.v2.insert(Address::from_slice(&r.pool_addr), (t0, t1, fee));
+                }
+            }
+            DexType::UniswapV4 => {
+                if r.pool_addr.len() == 32 {
+                    cache.v4.insert(B256::from_slice(&r.pool_addr), (t0, t1, fee));
+                }
+            }
+            DexType::PancakeswapV4Cl => {
+                if r.pool_addr.len() == 32 {
+                    cache.pcs_v4_cl.insert(B256::from_slice(&r.pool_addr), (t0, t1, fee));
+                }
+            }
+        }
+    }
+    Ok(cache)
 }
 
 // ============== TOKENS（白名单）==============
@@ -383,28 +492,17 @@ pub async fn rebuild_buckets_from_swaps(_range_start_ms: i64) -> Result<()> {
 
     txn.simple_query("LOCK TABLE token_1min_stats IN EXCLUSIVE MODE").await?;
     txn.simple_query("DELETE FROM token_1min_stats").await?;
+    // 新策略：main_pools 直接给出 pool→token 的 1:1 映射，不需要 UNION pools/v4_pools
     txn.execute(
-        "WITH active_pools AS (
-             SELECT address AS pool_id, chain, token0 AS t0, token1 AS t1 FROM pools
-             UNION ALL
-             SELECT pool_id, chain, currency0, currency1 FROM v4_pools
-         ),
-         pool_target AS (
-             SELECT ap.pool_id, ap.chain, bt.contract_address AS target_token
-             FROM active_pools ap
-             JOIN binance_bsc_tokens bt
-               ON ap.t0 = bt.contract_address
-               OR ap.t1 = bt.contract_address
-         )
-         INSERT INTO token_1min_stats (token_address, chain, bucket_start, total_volume_usd, total_fees_usd, swap_count)
-         SELECT pt.target_token, s.chain,
+        "INSERT INTO token_1min_stats (token_address, chain, bucket_start, total_volume_usd, total_fees_usd, swap_count)
+         SELECT mp.token_addr, s.chain,
                 (s.timestamp / 60000) * 60000,
                 SUM(s.volume_usd),
                 SUM(s.fee_usd),
                 COUNT(*)::INT
          FROM swaps s
-         JOIN pool_target pt ON pt.pool_id = s.pool_address AND pt.chain = s.chain
-         GROUP BY pt.target_token, s.chain, (s.timestamp / 60000) * 60000",
+         JOIN main_pools mp ON mp.pool_addr = s.pool_address
+         GROUP BY mp.token_addr, s.chain, (s.timestamp / 60000) * 60000",
         &[],
     ).await?;
 

@@ -12,10 +12,10 @@ CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 -- dex enum
 -- 1 = uniswap-v3
--- 2 = pancakeswap-v3
+-- 2 = pancakeswap-v3                    （BNB price 池也走 dex=2，PCS V3 WBNB/USDT 0.01% tier）
 -- 3 = uniswap-v4
 -- 4 = pancakeswap-v4-cl
--- 5 = pancakeswap-v2 (BNB price pool only)
+-- 5 = pancakeswap-v2                    （通用，36 个主池监控；不再仅 BNB price）
 
 CREATE TABLE IF NOT EXISTS pools (
   address BYTEA NOT NULL,        -- 20 bytes EVM address
@@ -117,3 +117,24 @@ CREATE TABLE IF NOT EXISTS bnb_price_history (
 CREATE INDEX IF NOT EXISTS idx_bnb_price_time ON bnb_price_history(timestamp);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_bnb_price_dedup
   ON bnb_price_history(tx_hash, log_index);
+
+-- main_pools：新策略「每 token 一个主池」索引表
+-- 由 scripts/probe-main-pools.ts + gen-main-pools-sql.ts 离线生成数据，定期 refresh
+-- backfill / stream 直接 SELECT 这张表加载主池，不再扫 PoolCreated 全集
+CREATE TABLE IF NOT EXISTS main_pools (
+  coin            VARCHAR(32) PRIMARY KEY,           -- 币安永续 baseAsset (e.g. BTC, ASTER, 1MBABYDOGE)
+  token_addr      BYTEA NOT NULL,                    -- 20 bytes 该 token 在 BSC 上的合约
+  pool_addr       BYTEA NOT NULL,                    -- 20 bytes (V2/V3) 或 32 bytes (V4 poolId)
+  pool_addr_size  SMALLINT NOT NULL,                 -- 20 或 32，方便分辨
+  dex             SMALLINT NOT NULL,                 -- 1..5 见上面注释
+  base_addr       BYTEA NOT NULL,                    -- 20 bytes WBNB/USDT/USDC/0x0(V4 native BNB)
+  base_sym        VARCHAR(10) NOT NULL,              -- WBNB / USDT / USDC / BNB
+  fee_bps         INTEGER,                           -- V3/V4 fee tier in basis points (e.g. 100=0.01%)
+  tvl_usd         NUMERIC,                           -- OKX top-liquidity 给的 TVL 快照（refresh 时更新）
+  is_native_bnb   BOOLEAN NOT NULL DEFAULT FALSE,    -- V4 native BNB 池（base_addr=0x000...000）
+  refreshed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (token_addr)
+);
+CREATE INDEX IF NOT EXISTS idx_main_pools_dex ON main_pools(dex);
+CREATE INDEX IF NOT EXISTS idx_main_pools_pool_addr ON main_pools(pool_addr);
+COMMENT ON TABLE main_pools IS '币安永续 BSC token 的项目方主池索引（每 token 一行，TVL 最大池）';

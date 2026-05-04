@@ -5,14 +5,17 @@ use std::collections::HashSet;
 pub const WBNB: Address = address!("bb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c");
 pub const USDT: Address = address!("55d398326f99059ff775485246999027b3197955");
 pub const USDC: Address = address!("8ac76a51cc950d9822d68b83fe1ad97b32cd580d");
+/// V4 native BNB 池：currency0 = 0x000…000 表示 native BNB（PCS V4 CL 直接收 native，不裹 WBNB）
+pub const NATIVE_BNB: Address = Address::ZERO;
 
 /// Base tokens：监控范围严格限定为 (target token, base token) 配对的池子。
-/// base = {WBNB, USDT, USDC}（不含 USD1 / native zero）。
+/// base = {WBNB, USDT, USDC, NATIVE_BNB(V4 native)}
 pub fn bsc_base_tokens() -> HashSet<Address> {
     let mut s = HashSet::new();
     s.insert(WBNB);
     s.insert(USDT);
     s.insert(USDC);
+    s.insert(NATIVE_BNB);
     s
 }
 

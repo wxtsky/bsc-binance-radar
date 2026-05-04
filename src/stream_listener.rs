@@ -4,12 +4,12 @@ use crate::abis::{PancakeV3Swap, PcsV4ClSwap, V2Swap, V3Swap, V4Swap};
 use crate::clients::bsc::{build_ws_client, default_ws_url};
 use crate::contracts::BscContracts;
 use crate::db::get_pool;
-use crate::db::queries::{load_v3_pool_cache, load_v4_pool_cache};
+use crate::db::queries::load_main_pool_cache;
 use crate::swap_processor::{
-    process_pcs_v4_cl_swap, process_v2_bnb_swap, process_v3_swap, process_v4_swap, BnbPriceCache,
-    PoolMeta,
+    process_pcs_v4_cl_swap, process_v2_swap, process_v3_bnb_swap, process_v3_swap,
+    process_v4_swap, BnbPriceCache, PoolMeta,
 };
-use crate::types::{BnbPricePoint, ChainId, DexType, SwapRecord, CHAIN_BSC};
+use crate::types::{BnbPricePoint, DexType, SwapRecord, CHAIN_BSC};
 use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
@@ -25,34 +25,34 @@ use tracing::{info, warn};
 pub struct PoolCache {
     pub v3: HashMap<Address, PoolMeta>,
     pub pcs_v3: HashMap<Address, PoolMeta>,
+    pub v2: HashMap<Address, PoolMeta>,
     pub v4: HashMap<B256, PoolMeta>,
     pub pcs_v4_cl: HashMap<B256, PoolMeta>,
 }
 
 pub async fn load_pool_cache_from_db() -> Result<PoolCache> {
-    let v3_raw = load_v3_pool_cache(CHAIN_BSC, DexType::UniswapV3).await?;
-    let pcs_v3_raw = load_v3_pool_cache(CHAIN_BSC, DexType::PancakeswapV3).await?;
-    let v4_raw = load_v4_pool_cache(CHAIN_BSC, DexType::UniswapV4).await?;
-    let pcs_v4_cl_raw = load_v4_pool_cache(CHAIN_BSC, DexType::PancakeswapV4Cl).await?;
-
-    let v3: HashMap<Address, PoolMeta> = v3_raw.into_iter().map(|(addr, (t0, t1, fee))| {
-        (addr, PoolMeta { token0: t0, token1: t1, fee_tier: fee })
-    }).collect();
-    let pcs_v3: HashMap<Address, PoolMeta> = pcs_v3_raw.into_iter().map(|(addr, (t0, t1, fee))| {
-        (addr, PoolMeta { token0: t0, token1: t1, fee_tier: fee })
-    }).collect();
-    let v4: HashMap<B256, PoolMeta> = v4_raw.into_iter().map(|(id, (c0, c1, fee))| {
-        (id, PoolMeta { token0: c0, token1: c1, fee_tier: fee })
-    }).collect();
-    let pcs_v4_cl: HashMap<B256, PoolMeta> = pcs_v4_cl_raw.into_iter().map(|(id, (c0, c1, fee))| {
-        (id, PoolMeta { token0: c0, token1: c1, fee_tier: fee })
-    }).collect();
+    let raw = load_main_pool_cache().await?;
+    let to_meta = |raw: HashMap<Address, (Address, Address, u32)>| -> HashMap<Address, PoolMeta> {
+        raw.into_iter().map(|(addr, (t0, t1, fee))| {
+            (addr, PoolMeta { token0: t0, token1: t1, fee_tier: fee })
+        }).collect()
+    };
+    let to_meta_b256 = |raw: HashMap<B256, (Address, Address, u32)>| -> HashMap<B256, PoolMeta> {
+        raw.into_iter().map(|(id, (c0, c1, fee))| {
+            (id, PoolMeta { token0: c0, token1: c1, fee_tier: fee })
+        }).collect()
+    };
+    let v3 = to_meta(raw.v3);
+    let pcs_v3 = to_meta(raw.pcs_v3);
+    let v2 = to_meta(raw.v2);
+    let v4 = to_meta_b256(raw.v4);
+    let pcs_v4_cl = to_meta_b256(raw.pcs_v4_cl);
 
     info!(
-        "[Stream] PoolCache loaded V3={} PCS V3={} V4={} PCS V4 CL={}",
-        v3.len(), pcs_v3.len(), v4.len(), pcs_v4_cl.len()
+        "[Stream] PoolCache from main_pools: V3={} PCS V3={} V2={} V4={} PCS V4 CL={}",
+        v3.len(), pcs_v3.len(), v2.len(), v4.len(), pcs_v4_cl.len()
     );
-    Ok(PoolCache { v3, pcs_v3, v4, pcs_v4_cl })
+    Ok(PoolCache { v3, pcs_v3, v2, v4, pcs_v4_cl })
 }
 
 async fn insert_swap(swap: &SwapRecord) -> Result<()> {
@@ -74,17 +74,13 @@ async fn insert_swap(swap: &SwapRecord) -> Result<()> {
     ).await?;
 
     // 实时累加 token_1min_stats（让 detector 实时看到 baseline 更新）
+    // 新策略：main_pools 一表搞定（每 pool 1 token），不再 UNION pools/v4_pools
     let bucket_start = (swap.timestamp / 60000) * 60000;
     client.execute(
         "INSERT INTO token_1min_stats (token_address, chain, bucket_start, total_volume_usd, total_fees_usd, swap_count)
-         SELECT bt.contract_address, $1, $2, $3, $4, 1
-         FROM (
-             SELECT token0, token1 FROM pools WHERE address = $5 AND chain = $1
-             UNION ALL
-             SELECT currency0 AS token0, currency1 AS token1 FROM v4_pools WHERE pool_id = $5 AND chain = $1
-         ) p
-         JOIN binance_bsc_tokens bt
-           ON bt.contract_address IN (p.token0, p.token1)
+         SELECT mp.token_addr, $1, $2, $3, $4, 1
+         FROM main_pools mp
+         WHERE mp.pool_addr = $5
          ON CONFLICT (token_address, chain, bucket_start) DO UPDATE SET
            total_volume_usd = token_1min_stats.total_volume_usd + EXCLUDED.total_volume_usd,
            total_fees_usd = token_1min_stats.total_fees_usd + EXCLUDED.total_fees_usd,
@@ -117,6 +113,7 @@ pub async fn run_stream_listener(
 
     let v3_addrs: Vec<Address> = pool_cache.v3.keys().copied().collect();
     let pcs_v3_addrs: Vec<Address> = pool_cache.pcs_v3.keys().copied().collect();
+    let v2_addrs: Vec<Address> = pool_cache.v2.keys().copied().collect();
 
     let v3_filter = Filter::new()
         .address(v3_addrs.clone())
@@ -124,6 +121,9 @@ pub async fn run_stream_listener(
     let pcs_v3_filter = Filter::new()
         .address(pcs_v3_addrs.clone())
         .event_signature(PancakeV3Swap::SIGNATURE_HASH);
+    let v2_filter = Filter::new()
+        .address(v2_addrs.clone())
+        .event_signature(V2Swap::SIGNATURE_HASH);
     let v4_filter = Filter::new()
         .address(BscContracts::UNISWAP_V4_POOL_MANAGER)
         .event_signature(V4Swap::SIGNATURE_HASH);
@@ -132,22 +132,26 @@ pub async fn run_stream_listener(
         .event_signature(PcsV4ClSwap::SIGNATURE_HASH);
     let bnb_filter = Filter::new()
         .address(BscContracts::BNB_PRICE_POOL)
-        .event_signature(V2Swap::SIGNATURE_HASH);
+        .event_signature(PancakeV3Swap::SIGNATURE_HASH);
 
     let v3_sub = provider.subscribe_logs(&v3_filter).await?;
     let pcs_v3_sub = provider.subscribe_logs(&pcs_v3_filter).await?;
+    let v2_sub = provider.subscribe_logs(&v2_filter).await?;
     let v4_sub = provider.subscribe_logs(&v4_filter).await?;
     let pcs_v4_sub = provider.subscribe_logs(&pcs_v4_cl_filter).await?;
     let bnb_sub = provider.subscribe_logs(&bnb_filter).await?;
 
-    info!("[Stream] subscribed 5 logs (V3 / PCS V3 / V4 / PCS V4 CL / BNB price)");
+    info!("[Stream] subscribed 6 logs (V3 / PCS V3 / V2 / V4 / PCS V4 CL / BNB price V3)");
 
     let mut v3_stream = v3_sub.into_stream();
     let mut pcs_v3_stream = pcs_v3_sub.into_stream();
+    let mut v2_stream = v2_sub.into_stream();
     let mut v4_stream = v4_sub.into_stream();
     let mut pcs_v4_stream = pcs_v4_sub.into_stream();
     let mut bnb_stream = bnb_sub.into_stream();
 
+    // PCS V3 WBNB/USDT 0.01% 池 (0x172fcD41E0913e95784454622d1c3724f546f849):
+    //   token0=USDT (0x55d39...), token1=WBNB (0xbb4cd...) → wbnb_is_token0 = false
     let bnb_pool_wbnb_is_token0 = false;
 
     loop {
@@ -210,9 +214,22 @@ pub async fn run_stream_listener(
                     }
                 }
             }
+            Some(log) = v2_stream.next() => {
+                let pool_addr = log.address();
+                if let Some(meta) = pool_cache.v2.get(&pool_addr) {
+                    let now_ms = Utc::now().timestamp_millis();
+                    let bnb_now = bnb_cache.get();
+                    if let Ok(rec) = process_v2_swap(&log, CHAIN_BSC, meta, pool_addr, now_ms, bnb_now) {
+                        if let Err(e) = insert_swap(&rec).await {
+                            warn!("[Stream] V2 insert fail: {}", e);
+                        }
+                        *last_swap_ms.write().await = now_ms;
+                    }
+                }
+            }
             Some(log) = bnb_stream.next() => {
                 let now_ms = Utc::now().timestamp_millis();
-                if let Ok((point, price)) = process_v2_bnb_swap(&log, now_ms, bnb_pool_wbnb_is_token0) {
+                if let Ok((point, price)) = process_v3_bnb_swap(&log, now_ms, bnb_pool_wbnb_is_token0) {
                     bnb_cache.set(price);
                     if let Err(e) = insert_bnb_price(&point).await {
                         warn!("[Stream] BNB insert fail: {}", e);

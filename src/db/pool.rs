@@ -64,5 +64,25 @@ pub async fn ensure_schema() -> Result<()> {
     client.simple_query("CREATE EXTENSION IF NOT EXISTS timescaledb").await
         .context("create timescaledb ext failed")?;
 
+    // 新策略表：main_pools（旧 PG 实例升级用，新建实例由 init.sql 处理）
+    client.simple_query(
+        "CREATE TABLE IF NOT EXISTS main_pools (
+           coin            VARCHAR(32) PRIMARY KEY,
+           token_addr      BYTEA NOT NULL,
+           pool_addr       BYTEA NOT NULL,
+           pool_addr_size  SMALLINT NOT NULL,
+           dex             SMALLINT NOT NULL,
+           base_addr       BYTEA NOT NULL,
+           base_sym        VARCHAR(10) NOT NULL,
+           fee_bps         INTEGER,
+           tvl_usd         NUMERIC,
+           is_native_bnb   BOOLEAN NOT NULL DEFAULT FALSE,
+           refreshed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+           UNIQUE (token_addr)
+         );
+         CREATE INDEX IF NOT EXISTS idx_main_pools_dex ON main_pools(dex);
+         CREATE INDEX IF NOT EXISTS idx_main_pools_pool_addr ON main_pools(pool_addr);"
+    ).await.context("ensure main_pools failed")?;
+
     Ok(())
 }
