@@ -52,7 +52,7 @@ impl FeishuNotifier {
                         "fields": [
                             { "is_short": true, "text": { "tag": "lark_md", "content": format!("**Token**：`{}`", trigger.symbol) } },
                             { "is_short": true, "text": { "tag": "lark_md", "content": format!("**时间**：{}", dt.format("%Y-%m-%d %H:%M:%S UTC")) } },
-                            { "is_short": false, "text": { "tag": "lark_md", "content": format!("**地址**：`{}`", trigger.token_address) } },
+                            { "is_short": false, "text": { "tag": "lark_md", "content": format!("**地址**：`0x{}`", hex::encode(&trigger.token_address)) } },
                         ]
                     },
                     {

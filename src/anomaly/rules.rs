@@ -50,7 +50,14 @@ pub enum AnomalyRule {
 }
 
 impl AnomalyRule {
-    pub fn as_db_str(&self) -> &'static str {
+    /// schema: anomaly_events.rule SMALLINT (1=vol_spike, 2=combo)
+    pub fn as_db_smallint(&self) -> i16 {
+        match self {
+            AnomalyRule::VolSpike => 1,
+            AnomalyRule::Combo => 2,
+        }
+    }
+    pub fn as_label(&self) -> &'static str {
         match self {
             AnomalyRule::VolSpike => "vol_spike",
             AnomalyRule::Combo => "combo",
@@ -60,7 +67,7 @@ impl AnomalyRule {
 
 #[derive(Debug, Clone)]
 pub struct AnomalyTrigger {
-    pub token_address: String,
+    pub token_address: Vec<u8>,    // BYTEA(20)
     pub symbol: String,
     pub rule: AnomalyRule,
     pub metrics: serde_json::Value,

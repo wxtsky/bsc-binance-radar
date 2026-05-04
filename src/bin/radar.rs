@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
                     warn!("[Notifier] feishu send fail for {}: {}", trigger.symbol, e);
                 } else {
                     info!("[Notifier] feishu sent: {} {} {:?}",
-                        trigger.symbol, trigger.token_address, trigger.rule);
+                        trigger.symbol, hex::encode(&trigger.token_address), trigger.rule);
                 }
             }
         }))
@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
         Some(tokio::spawn(async move {
             while let Some(trigger) = anomaly_rx.recv().await {
                 info!("[Notifier:dry] {} {} {:?}",
-                    trigger.symbol, trigger.token_address, trigger.rule);
+                    trigger.symbol, hex::encode(&trigger.token_address), trigger.rule);
             }
         }))
     };

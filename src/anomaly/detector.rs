@@ -93,13 +93,14 @@ async fn try_trigger(
     tx: &mpsc::Sender<AnomalyTrigger>,
 ) -> Result<()> {
     let cooldown_since = now_ms - cooldown_ms;
-    if is_in_cooldown(&b.token_address, rule.as_db_str(), cooldown_since).await? {
+    let rule_db = rule.as_db_smallint();
+    if is_in_cooldown(&b.token_address, rule_db, cooldown_since).await? {
         return Ok(());
     }
     record_anomaly(
         &b.token_address,
         b.symbol.as_deref(),
-        rule.as_db_str(),
+        rule_db,
         metrics.clone(),
         now_ms,
     ).await?;
@@ -111,7 +112,10 @@ async fn try_trigger(
         metrics,
         detected_at: now_ms,
     };
-    info!("[Detector] triggered {:?} {} {}", rule, b.token_address, trigger.symbol);
+    info!(
+        "[Detector] triggered {:?} 0x{} {}",
+        rule, hex::encode(&b.token_address), trigger.symbol
+    );
     if let Err(e) = tx.send(trigger).await {
         warn!("[Detector] notify channel closed: {}", e);
     }
