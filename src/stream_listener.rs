@@ -60,15 +60,18 @@ async fn insert_swap(swap: &SwapRecord) -> Result<()> {
     let pool_addr_slice = swap.pool_address.as_slice();
     let tx_hash_slice = swap.tx_hash.as_slice();
     let dex_smallint = swap.dex.as_db_smallint();
-    let amount0_str = swap.amount0.to_string();
-    let amount1_str = swap.amount1.to_string();
+    // amount0/1 schema 是 BYTEA(32) i256 big-endian raw（不是 numeric）
+    let amount0_bytes = swap.amount0.to_be_bytes::<32>();
+    let amount1_bytes = swap.amount1.to_be_bytes::<32>();
+    let amount0_slice: &[u8] = &amount0_bytes;
+    let amount1_slice: &[u8] = &amount1_bytes;
     client.execute(
         "INSERT INTO swaps (pool_address, chain, dex, tx_hash, amount0, amount1, fee_usd, volume_usd, timestamp, block_number)
-         VALUES ($1, $2, $3, $4, $5::numeric, $6::numeric, $7, $8, $9, $10)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          ON CONFLICT (tx_hash, pool_address, amount0, amount1, timestamp) DO NOTHING",
         &[
             &pool_addr_slice, &swap.chain, &dex_smallint, &tx_hash_slice,
-            &amount0_str, &amount1_str, &swap.fee_usd, &swap.volume_usd,
+            &amount0_slice, &amount1_slice, &swap.fee_usd, &swap.volume_usd,
             &swap.timestamp, &swap.block_number,
         ],
     ).await?;
