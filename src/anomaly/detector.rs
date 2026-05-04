@@ -34,6 +34,11 @@ async fn run_one_tick(config: &AnomalyConfig, tx: &mpsc::Sender<AnomalyTrigger>)
             continue;
         }
 
+        // 小额 swap 直接 skip（防 vol_5min < $5k 的微量交易触发假信号）
+        if b.vol_5min_usd < config.min_vol_5min_usd {
+            continue;
+        }
+
         // vol_spike: vol_5min / vol_24h_avg_5min ≥ ratio
         let ratio = if b.vol_24h_avg_5min_usd > 0.0 {
             b.vol_5min_usd / b.vol_24h_avg_5min_usd

@@ -14,6 +14,8 @@ pub struct AnomalyConfig {
     pub detect_interval_ms: i64,
     pub cooldown_ms: i64,
     pub baseline_min_coverage_ms: i64,
+    /// 5min vol 必须 ≥ 此美元数才考虑触发（防小额 swap 假信号）
+    pub min_vol_5min_usd: f64,
 }
 
 impl AnomalyConfig {
@@ -22,7 +24,7 @@ impl AnomalyConfig {
             vol_spike_ratio: std::env::var("ANOMALY_VOL_SPIKE_RATIO")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(5.0),
+                .unwrap_or(10.0),
             fee_tvl_apr: std::env::var("ANOMALY_FEE_TVL_APR")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -34,11 +36,15 @@ impl AnomalyConfig {
             cooldown_ms: std::env::var("ANOMALY_COOLDOWN_MS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(300_000),
+                .unwrap_or(1_800_000),  // 30 min
             baseline_min_coverage_ms: std::env::var("ANOMALY_BASELINE_MIN_COVERAGE_MS")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3_600_000),
+            min_vol_5min_usd: std::env::var("ANOMALY_MIN_VOL_5MIN_USD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5_000.0),  // $5k 以下不触发
         }
     }
 }
